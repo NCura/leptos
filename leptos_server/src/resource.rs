@@ -26,7 +26,7 @@ use reactive_graph::{
 };
 use std::{
     future::{pending, IntoFuture},
-    ops::Deref,
+    ops::{Deref, DerefMut},
     panic::Location,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -162,6 +162,65 @@ where
     }
 }
 
+impl<T, Ser> Notify for ArcResource<T, Ser>
+where
+    T: 'static,
+{
+    fn notify(&self) {
+        self.data.notify()
+    }
+}
+
+impl<T, Ser> Write for ArcResource<T, Ser>
+where
+    T: 'static,
+{
+    type Value = Option<T>;
+
+    fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {
+        self.data.try_write()
+    }
+
+    fn try_write_untracked(
+        &self,
+    ) -> Option<impl DerefMut<Target = Self::Value>> {
+        self.data.try_write_untracked()
+    }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static RESOURCE_SOURCE_SIGNAL_ACTIVE: AtomicBool = const { AtomicBool::new(false) };
+}
+
+#[cfg(debug_assertions)]
+/// Returns whether the current thread is currently running a resource source signal.
+pub fn in_resource_source_signal() -> bool {
+    RESOURCE_SOURCE_SIGNAL_ACTIVE
+        .with(|scope| scope.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Set a static to true whilst running the given function.
+/// [`is_in_effect_scope`] will return true whilst the function is running.
+fn run_in_resource_source_signal<T>(fun: impl FnOnce() -> T) -> T {
+    #[cfg(debug_assertions)]
+    {
+        // For the theoretical nested case, set back to initial value rather than false:
+        let initial = RESOURCE_SOURCE_SIGNAL_ACTIVE.with(|scope| {
+            scope.swap(true, std::sync::atomic::Ordering::Relaxed)
+        });
+        let result = fun();
+        RESOURCE_SOURCE_SIGNAL_ACTIVE.with(|scope| {
+            scope.store(initial, std::sync::atomic::Ordering::Relaxed)
+        });
+        result
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        fun()
+    }
+}
+
 impl<T, Ser> ReadUntracked for ArcResource<T, Ser>
 where
     T: 'static,
@@ -176,7 +235,9 @@ where
                 computed::suspense::SuspenseContext, effect::in_effect_scope,
                 owner::use_context,
             };
-            if !in_effect_scope() && use_context::<SuspenseContext>().is_none()
+            if !in_effect_scope()
+                && !in_resource_source_signal()
+                && use_context::<SuspenseContext>().is_none()
             {
                 let location = std::panic::Location::caller();
                 reactive_graph::log_warning(format_args!(
@@ -245,7 +306,7 @@ where
         let refetch = ArcRwSignal::new(0);
         let source = ArcMemo::new({
             let refetch = refetch.clone();
-            move |_| (refetch.get(), source())
+            move |_| (refetch.get(), run_in_resource_source_signal(&source))
         });
         let fun = {
             let source = source.clone();
@@ -683,6 +744,7 @@ where
 }
 
 #[cfg(feature = "rkyv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rkyv")))]
 impl<T> ArcResource<T, RkyvCodec>
 where
     RkyvCodec: Encoder<T> + Decoder<T>,
@@ -842,6 +904,32 @@ where
     }
 }
 
+impl<T, Ser> Notify for Resource<T, Ser>
+where
+    T: Send + Sync + 'static,
+{
+    fn notify(&self) {
+        self.data.notify()
+    }
+}
+
+impl<T, Ser> Write for Resource<T, Ser>
+where
+    T: Send + Sync + 'static,
+{
+    type Value = Option<T>;
+
+    fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {
+        self.data.try_write()
+    }
+
+    fn try_write_untracked(
+        &self,
+    ) -> Option<impl DerefMut<Target = Self::Value>> {
+        self.data.try_write_untracked()
+    }
+}
+
 impl<T, Ser> ReadUntracked for Resource<T, Ser>
 where
     T: Send + Sync + 'static,
@@ -856,7 +944,9 @@ where
                 computed::suspense::SuspenseContext, effect::in_effect_scope,
                 owner::use_context,
             };
-            if !in_effect_scope() && use_context::<SuspenseContext>().is_none()
+            if !in_effect_scope()
+                && !in_resource_source_signal()
+                && use_context::<SuspenseContext>().is_none()
             {
                 let location = std::panic::Location::caller();
                 reactive_graph::log_warning(format_args!(
@@ -996,6 +1086,7 @@ where
 }
 
 #[cfg(feature = "serde-wasm-bindgen")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde-wasm-bindgen")))]
 impl<T> Resource<T, JsonSerdeWasmCodec>
 where
     JsonSerdeWasmCodec: Encoder<T> + Decoder<T>,
@@ -1053,6 +1144,7 @@ where
 }
 
 #[cfg(feature = "miniserde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "miniserde")))]
 impl<T> Resource<T, MiniserdeCodec>
 where
     MiniserdeCodec: Encoder<T> + Decoder<T>,
@@ -1112,6 +1204,7 @@ where
 }
 
 #[cfg(feature = "serde-lite")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde-lite")))]
 impl<T> Resource<T, SerdeLite<JsonSerdeCodec>>
 where
     SerdeLite<JsonSerdeCodec>: Encoder<T> + Decoder<T>,
@@ -1170,6 +1263,7 @@ where
 }
 
 #[cfg(feature = "rkyv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rkyv")))]
 impl<T> Resource<T, RkyvCodec>
 where
     RkyvCodec: Encoder<T> + Decoder<T>,

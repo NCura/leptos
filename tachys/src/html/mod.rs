@@ -9,7 +9,24 @@ use crate::{
     },
     view::{Position, PositionState, Render, RenderHtml},
 };
+use attribute::any_attribute::AnyAttribute;
 use std::borrow::Cow;
+
+/// Diagnostic message shared by event, directive, and property `.expect()` calls.
+///
+/// When the `ssr` feature is active, tachys skips creating client-side values
+/// (event handlers, directives, properties) to avoid `SendWrapper` cross-thread
+/// panics on multithreaded servers. If these `.expect()` calls fire, it means
+/// the `ssr` feature was activated unintentionally via Cargo feature
+/// unification in a client-side (CSR or hydrate) build.
+pub(crate) const FEATURE_CONFLICT_DIAGNOSTIC: &str =
+    "Value is None because the `ssr` feature is active. When `ssr` is \
+     enabled, tachys skips creating client-side values (event handlers, \
+     directives, properties) to avoid cross-thread panics on multithreaded \
+     servers. If you are building a client-side (CSR or hydrate) target, this \
+     means the `ssr` feature is being activated unintentionally via Cargo \
+     feature unification; another dependency in your workspace is enabling \
+     it. Run `cargo tree -e features -i tachys` to identify the source.";
 
 /// Types for HTML attributes.
 pub mod attribute;
@@ -52,6 +69,7 @@ no_attrs!(Doctype);
 
 impl RenderHtml for Doctype {
     type AsyncOutput = Self;
+    type Owned = Self;
 
     const MIN_LENGTH: usize = "<!DOCTYPE html>".len();
 
@@ -67,6 +85,7 @@ impl RenderHtml for Doctype {
         _position: &mut Position,
         _escape: bool,
         _mark_branches: bool,
+        _extra_attrs: Vec<AnyAttribute>,
     ) {
         buf.push_str("<!DOCTYPE ");
         buf.push_str(self.value);
@@ -78,6 +97,10 @@ impl RenderHtml for Doctype {
         _cursor: &Cursor,
         _position: &PositionState,
     ) -> Self::State {
+    }
+
+    fn into_owned(self) -> Self::Owned {
+        self
     }
 }
 
@@ -108,20 +131,24 @@ impl Mountable for InertElementState {
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {
         self.1.insert_before_this(child)
     }
+
+    fn elements(&self) -> Vec<crate::renderer::types::Element> {
+        vec![self.1.clone()]
+    }
 }
 
 impl Render for InertElement {
     type State = InertElementState;
 
     fn build(self) -> Self::State {
-        let el = Rndr::create_element_from_html(&self.html);
+        let el = Rndr::create_element_from_html(self.html.clone());
         InertElementState(self.html, el)
     }
 
     fn rebuild(self, state: &mut Self::State) {
         let InertElementState(prev, el) = state;
         if &self.html != prev {
-            let mut new_el = Rndr::create_element_from_html(&self.html);
+            let mut new_el = Rndr::create_element_from_html(self.html.clone());
             el.insert_before_this(&mut new_el);
             el.unmount();
             *el = new_el;
@@ -149,6 +176,7 @@ impl AddAnyAttr for InertElement {
 
 impl RenderHtml for InertElement {
     type AsyncOutput = Self;
+    type Owned = Self;
 
     const MIN_LENGTH: usize = 0;
 
@@ -168,6 +196,7 @@ impl RenderHtml for InertElement {
         position: &mut Position,
         _escape: bool,
         _mark_branches: bool,
+        _extra_attrs: Vec<AnyAttribute>,
     ) {
         buf.push_str(&self.html);
         *position = Position::NextChild;
@@ -188,5 +217,9 @@ impl RenderHtml for InertElement {
             .unwrap();
         position.set(Position::NextChild);
         InertElementState(self.html, el)
+    }
+
+    fn into_owned(self) -> Self::Owned {
+        self
     }
 }

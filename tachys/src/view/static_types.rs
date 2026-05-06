@@ -4,10 +4,12 @@ use super::{
 };
 use crate::{
     html::attribute::{
+        any_attribute::AnyAttribute,
         maybe_next_attr_erasure_macros::{
             next_attr_combine, next_attr_output_type,
         },
-        Attribute, AttributeKey, AttributeValue, NextAttribute,
+        Attribute, AttributeKey, AttributeValue, NamedAttributeKey,
+        NextAttribute,
     },
     hydration::Cursor,
     renderer::{CastFrom, Rndr},
@@ -110,6 +112,10 @@ where
     async fn resolve(self) -> Self::AsyncOutput {
         self
     }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![NamedAttributeKey::Attribute(K::KEY.into())]
+    }
 }
 
 impl<K, const V: &'static str> NextAttribute for StaticAttr<K, V>
@@ -161,6 +167,7 @@ where
 
 impl<const V: &'static str> RenderHtml for Static<V> {
     type AsyncOutput = Self;
+    type Owned = Self;
 
     const MIN_LENGTH: usize = V.len();
 
@@ -180,6 +187,7 @@ impl<const V: &'static str> RenderHtml for Static<V> {
         position: &mut Position,
         escape: bool,
         _mark_branches: bool,
+        _extra_attrs: Vec<AnyAttribute>,
     ) {
         // add a comment node to separate from previous sibling, if any
         if matches!(position, Position::NextChildAfterText) {
@@ -221,6 +229,10 @@ impl<const V: &'static str> RenderHtml for Static<V> {
         position.set(Position::NextChildAfterText);
 
         Some(node)
+    }
+
+    fn into_owned(self) -> Self::Owned {
+        self
     }
 }
 

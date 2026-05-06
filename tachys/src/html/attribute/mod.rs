@@ -8,7 +8,6 @@ pub mod custom;
 pub mod global;
 mod key;
 pub(crate) mod maybe_next_attr_erasure_macros;
-pub(crate) mod panic_on_clone_attribute;
 mod value;
 
 use crate::view::{Position, ToTemplate};
@@ -16,7 +15,7 @@ pub use key::*;
 use maybe_next_attr_erasure_macros::{
     next_attr_combine, next_attr_output_type,
 };
-use std::{fmt::Debug, future::Future};
+use std::{borrow::Cow, fmt::Debug, future::Future};
 pub use value::*;
 
 /// Defines an attribute: anything that can modify an element.
@@ -76,25 +75,25 @@ pub trait Attribute: NextAttribute + Send {
 
     /// “Resolves” this into a type that is not waiting for any asynchronous data.
     fn resolve(self) -> impl Future<Output = Self::AsyncOutput> + Send;
-}
 
-/// A type that can be converted into an attribute.
-///
-/// Used type-erasing attrs and tuples of attrs to [`Vec<AnyAttribute>`] as early as possible to prevent type explosion.
-pub trait IntoAttribute {
-    /// The type of the attribute.
-    type Output: Attribute;
-
-    /// Converts this into an attribute.
-    fn into_attr(self) -> Self::Output;
-}
-
-impl<T: Attribute> IntoAttribute for T {
-    type Output = T;
-
-    fn into_attr(self) -> Self::Output {
-        self
+    /// Returns a set of attribute keys, associated with this attribute, if any.
+    ///
+    /// This is only used to manage the removal of type-erased attributes, when needed.
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        // TODO: remove default implementation in 0.9, or fix this whole approach
+        // by making it easier to remove attributes
+        vec![]
     }
+}
+
+/// An attribute key can be used to remove an attribute from an element.
+pub enum NamedAttributeKey {
+    /// An ordinary attribute.
+    Attribute(Cow<'static, str>),
+    /// A DOM property.
+    Property(Cow<'static, str>),
+    /// The `inner_html` pseudo-attribute.
+    InnerHtml,
 }
 
 /// Adds another attribute to this one, returning a new attribute.
@@ -153,6 +152,10 @@ impl Attribute for () {
     fn dry_resolve(&mut self) {}
 
     async fn resolve(self) -> Self::AsyncOutput {}
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![]
+    }
 }
 
 impl NextAttribute for () {
@@ -269,6 +272,10 @@ where
     async fn resolve(self) -> Self::AsyncOutput {
         Attr(self.0, self.1.resolve().await)
     }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![NamedAttributeKey::Attribute(K::KEY.into())]
+    }
 }
 
 impl<K, V> NextAttribute for Attr<K, V>
@@ -288,7 +295,6 @@ where
 
 macro_rules! impl_attr_for_tuples {
     ($first:ident, $($ty:ident),* $(,)?) => {
-        #[cfg(not(erase_components))]
         impl<$first, $($ty),*> Attribute for ($first, $($ty,)*)
         where
             $first: Attribute,
@@ -374,9 +380,16 @@ macro_rules! impl_attr_for_tuples {
                     $($ty.resolve()),*
                 )
             }
+
+            fn keys(&self) -> Vec<NamedAttributeKey> {
+                #[allow(non_snake_case)]
+                let ($first, $($ty,)*) = &self;
+                let mut buf = $first.keys();
+                $(buf.extend($ty.keys());)*
+                buf
+            }
         }
 
-        #[cfg(not(erase_components))]
         impl<$first, $($ty),*> NextAttribute for ($first, $($ty,)*)
         where
             $first: Attribute,
@@ -394,38 +407,15 @@ macro_rules! impl_attr_for_tuples {
                 ($first, $($ty,)* new_attr)
             }
         }
-
-
-        #[cfg(erase_components)]
-        impl<$first, $($ty),*> IntoAttribute for ($first, $($ty,)*)
-        where
-            $first: IntoAttribute,
-            $($ty: IntoAttribute),*,
-            {
-            type Output = Vec<$crate::html::attribute::any_attribute::AnyAttribute>;
-
-            fn into_attr(self) -> Self::Output {
-                use crate::html::attribute::any_attribute::IntoAnyAttribute;
-
-                #[allow(non_snake_case)]
-                let ($first, $($ty,)*) = self;
-                vec![
-                    $first.into_attr().into_any_attr(),
-                    $($ty.into_attr().into_any_attr(),)*
-                ]
-            }
-        }
     };
 }
 
 macro_rules! impl_attr_for_tuples_truncate_additional {
     ($first:ident, $($ty:ident),* $(,)?) => {
-        #[cfg(not(erase_components))]
         impl<$first, $($ty),*> Attribute for ($first, $($ty,)*)
         where
             $first: Attribute,
             $($ty: Attribute),*,
-
         {
             const MIN_LENGTH: usize = $first::MIN_LENGTH $(+ $ty::MIN_LENGTH)*;
 
@@ -507,9 +497,16 @@ macro_rules! impl_attr_for_tuples_truncate_additional {
                     $($ty.resolve()),*
                 )
             }
+
+            fn keys(&self) -> Vec<NamedAttributeKey> {
+                #[allow(non_snake_case)]
+                let ($first, $($ty,)*) = &self;
+                let mut buf = $first.keys();
+                $(buf.extend($ty.keys());)*
+                buf
+            }
         }
 
-        #[cfg(not(erase_components))]
         impl<$first, $($ty),*> NextAttribute for ($first, $($ty,)*)
         where
             $first: Attribute,
@@ -526,38 +523,9 @@ macro_rules! impl_attr_for_tuples_truncate_additional {
                 //($first, $($ty,)*)
             }
         }
-
-        #[cfg(erase_components)]
-        impl<$first, $($ty),*> IntoAttribute for ($first, $($ty,)*)
-        where
-            $first: IntoAttribute,
-            $($ty: IntoAttribute),*,
-        {
-            type Output = $crate::html::attribute::any_attribute::AnyAttribute;
-
-            fn into_attr(self) -> Self::Output {
-                todo!("adding more than 26 attributes is not supported");
-                //crate::html::attribute::any_attribute::IntoAnyAttribute::into_any_attr(self)
-            }
-        }
     };
 }
 
-#[cfg(erase_components)]
-impl<A> IntoAttribute for (A,)
-where
-    A: IntoAttribute,
-{
-    type Output = Vec<crate::html::attribute::any_attribute::AnyAttribute>;
-
-    fn into_attr(self) -> Self::Output {
-        use crate::html::attribute::any_attribute::IntoAnyAttribute;
-
-        vec![self.0.into_attr().into_any_attr()]
-    }
-}
-
-#[cfg(not(erase_components))]
 impl<A> Attribute for (A,)
 where
     A: Attribute,
@@ -613,9 +581,12 @@ where
     async fn resolve(self) -> Self::AsyncOutput {
         (self.0.resolve().await,)
     }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        self.0.keys()
+    }
 }
 
-#[cfg(not(erase_components))]
 impl<A> NextAttribute for (A,)
 where
     A: Attribute,

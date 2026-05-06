@@ -4,7 +4,7 @@ use crate::{
         maybe_next_attr_erasure_macros::{
             next_attr_combine, next_attr_output_type,
         },
-        Attribute, NextAttribute,
+        Attribute, NamedAttributeKey, NextAttribute,
     },
     renderer::Rndr,
     view::add_attr::AddAnyAttr,
@@ -104,6 +104,10 @@ where
         InnerHtml {
             value: self.value.resolve().await,
         }
+    }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![NamedAttributeKey::InnerHtml]
     }
 }
 
@@ -292,7 +296,7 @@ impl InnerHtmlValue for Arc<str> {
     }
 
     fn rebuild(self, state: &mut Self::State) {
-        if !Arc::ptr_eq(&self, &state.1) {
+        if self != state.1 {
             Rndr::set_inner_html(&state.0, &self);
             state.1 = self;
         }

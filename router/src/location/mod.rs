@@ -14,7 +14,7 @@ use send_wrapper::SendWrapper;
 use std::{borrow::Cow, future::Future};
 use tachys::dom::window;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{Event, HtmlAnchorElement, MouseEvent};
+use web_sys::{HtmlAnchorElement, MouseEvent};
 
 mod history;
 mod server;
@@ -67,10 +67,32 @@ impl Url {
     }
 
     pub fn hash(&self) -> &str {
+        #[cfg(all(feature = "ssr", any(debug_assertions, leptos_debuginfo)))]
+        {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "Reading hash on the server can lead to hydration errors."
+            );
+            #[cfg(not(feature = "tracing"))]
+            eprintln!(
+                "Reading hash on the server can lead to hydration errors."
+            );
+        }
         &self.hash
     }
 
     pub fn hash_mut(&mut self) -> &mut String {
+        #[cfg(all(feature = "ssr", any(debug_assertions, leptos_debuginfo)))]
+        {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "Reading hash on the server can lead to hydration errors."
+            );
+            #[cfg(not(feature = "tracing"))]
+            eprintln!(
+                "Reading hash on the server can lead to hydration errors."
+            );
+        }
         &mut self.hash
     }
 
@@ -118,8 +140,7 @@ impl Url {
         #[cfg(feature = "ssr")]
         {
             percent_encoding::percent_decode_str(s)
-                .decode_utf8()
-                .unwrap()
+                .decode_utf8_lossy()
                 .to_string()
         }
 
@@ -173,7 +194,7 @@ impl Location {
         let state = state.into();
         let pathname = Memo::new(move |_| url.with(|url| url.path.clone()));
         let search = Memo::new(move |_| url.with(|url| url.search.clone()));
-        let hash = Memo::new(move |_| url.with(|url| url.hash.clone()));
+        let hash = Memo::new(move |_| url.with(|url| url.hash().to_string()));
         let query =
             Memo::new(move |_| url.with(|url| url.search_params.clone()));
         Location {
@@ -278,15 +299,14 @@ pub(crate) fn handle_anchor_click<NavFn, NavFut>(
     router_base: Option<Cow<'static, str>>,
     parse_with_base: fn(&str, &str) -> Result<Url, JsValue>,
     navigate: NavFn,
-) -> Box<dyn Fn(Event) -> Result<(), JsValue>>
+) -> Box<dyn Fn(MouseEvent) -> Result<(), JsValue>>
 where
     NavFn: Fn(Url, LocationChange) -> NavFut + 'static,
     NavFut: Future<Output = ()> + 'static,
 {
     let router_base = router_base.unwrap_or_default();
 
-    Box::new(move |ev: Event| {
-        let ev = ev.unchecked_into::<MouseEvent>();
+    Box::new(move |ev: MouseEvent| {
         let origin = window().location().origin()?;
         if ev.default_prevented()
             || ev.button() != 0
@@ -347,8 +367,8 @@ where
             ev.prevent_default();
             let to = path_name
                 + if url.search.is_empty() { "" } else { "?" }
-                + &Url::unescape(&url.search)
-                + &Url::unescape(&url.hash);
+                + &url.search
+                + &url.hash;
             let state = Reflect::get(&a, &JsValue::from_str("state"))
                 .ok()
                 .and_then(|value| {

@@ -1,3 +1,4 @@
+use super::suspense::TaskHandle;
 use crate::{
     channel::Sender,
     computed::suspense::SuspenseContext,
@@ -22,6 +23,7 @@ pub(crate) struct ArcAsyncDerivedInner {
     pub state: AsyncDerivedState,
     pub version: usize,
     pub suspenses: Vec<SuspenseContext>,
+    pub pending_suspenses: Vec<TaskHandle>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,8 +50,8 @@ impl ReactiveNode for RwLock<ArcAsyncDerivedInner> {
     }
 
     fn mark_subscribers_check(&self) {
-        let lock = self.read().or_poisoned();
-        for sub in (&lock.subscribers).into_iter() {
+        let subs = self.read().or_poisoned().subscribers.clone();
+        for sub in subs {
             sub.mark_check();
         }
     }

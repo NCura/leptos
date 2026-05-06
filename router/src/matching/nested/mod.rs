@@ -1,5 +1,5 @@
 use super::{
-    MatchInterface, MatchNestedRoutes, PartialPathMatch, PathSegment,
+    IntoChooseViewMaybeErased, MatchInterface, MatchNestedRoutes, PathSegment,
     PossibleRouteMatch, RouteMatchId,
 };
 use crate::{ChooseView, GeneratedRouteData, MatchParams, Method, SsrMode};
@@ -10,7 +10,10 @@ use std::{
     collections::HashSet,
     sync::atomic::{AtomicU16, Ordering},
 };
+use tachys::prelude::IntoMaybeErased;
 
+pub mod any_nested_match;
+pub mod any_nested_route;
 mod tuples;
 
 pub(crate) static ROUTE_ID: AtomicU16 = AtomicU16::new(1);
@@ -24,6 +27,31 @@ pub struct NestedRoute<Segments, Children, Data, View> {
     view: View,
     methods: HashSet<Method>,
     ssr_mode: SsrMode,
+}
+
+impl<Segments, Children, Data, View> IntoMaybeErased
+    for NestedRoute<Segments, Children, Data, View>
+where
+    Self: MatchNestedRoutes + Send + Clone + 'static,
+{
+    #[cfg(erase_components)]
+    type Output = any_nested_route::AnyNestedRoute;
+
+    #[cfg(not(erase_components))]
+    type Output = Self;
+
+    fn into_maybe_erased(self) -> Self::Output {
+        #[cfg(erase_components)]
+        {
+            use any_nested_route::IntoAnyNestedRoute;
+
+            self.into_any_nested_route()
+        }
+        #[cfg(not(erase_components))]
+        {
+            self
+        }
+    }
 }
 
 impl<Segments, Children, Data, View> Clone
@@ -48,16 +76,24 @@ where
 }
 
 impl<Segments, View> NestedRoute<Segments, (), (), View> {
-    pub fn new(path: Segments, view: View) -> Self
+    pub fn new(
+        path: Segments,
+        view: View,
+    ) -> NestedRoute<
+        Segments,
+        (),
+        (),
+        <View as IntoChooseViewMaybeErased>::Output,
+    >
     where
         View: ChooseView,
     {
-        Self {
+        NestedRoute {
             id: ROUTE_ID.fetch_add(1, Ordering::Relaxed),
             segments: path,
             children: None,
             data: (),
-            view,
+            view: view.into_maybe_erased(),
             methods: [Method::Get].into(),
             ssr_mode: Default::default(),
         }
@@ -151,63 +187,120 @@ impl<Segments, Children, Data, View> MatchNestedRoutes
     for NestedRoute<Segments, Children, Data, View>
 where
     Self: 'static,
-    Segments: PossibleRouteMatch + std::fmt::Debug,
+    Segments: PossibleRouteMatch,
     Children: MatchNestedRoutes,
-    Children::Match: MatchParams,
-    Children: 'static,
-    View: ChooseView + Clone,
+    View: ChooseView,
 {
     type Data = Data;
     type Match = NestedMatch<Children::Match, View>;
+
+    fn optional(&self) -> bool {
+        self.segments.optional()
+            && self.children.as_ref().map(|n| n.optional()).unwrap_or(true)
+    }
 
     fn match_nested<'a>(
         &'a self,
         path: &'a str,
     ) -> (Option<(RouteMatchId, Self::Match)>, &'a str) {
+        // if this was optional (for example, this whole nested route definition consisted of an optional param),
+        // then we'll need to retest the inner value against the starting path, if this one succeeds and the inner one fails
+        let this_was_optional = self.segments.optional();
+
         self.segments
             .test(path)
-            .and_then(
-                |PartialPathMatch {
-                     remaining,
-                     mut params,
-                     matched,
-                 }| {
-                    let (_, inner, remaining) = match &self.children {
-                        None => (None, None, remaining),
+            .and_then({
+                type Params = Vec<(Cow<'static, str>, String)>;
+
+                // codegen optimisation:
+                fn inner<'a, Children>(
+                    this_was_optional: bool,
+                    path: &'a str,
+                    remaining: &'a str,
+                    segments: &dyn PossibleRouteMatch,
+                    children: &'a Option<Children>,
+                    mut params: Params,
+                ) -> Option<(Option<Children::Match>, &'a str, Params)>
+                where
+                    Children: MatchNestedRoutes,
+                {
+                    let mut was_optional_fallback = false;
+
+                    let (child, remaining) = match children {
+                        None => (None, remaining),
                         Some(children) => {
                             let (inner, remaining) =
                                 children.match_nested(remaining);
-                            let (id, inner) = inner?;
-                            (Some(id), Some(inner), remaining)
+
+                            if let Some((_, child)) = inner {
+                                (Some(child), remaining)
+                            } else if this_was_optional {
+                                // if the parent route was optional, re-match children against full path
+                                was_optional_fallback = true;
+                                let (inner, remaining) =
+                                    children.match_nested(path);
+                                inner.map(|(_, child)| {
+                                    (Some(child), remaining)
+                                })?
+                            } else {
+                                return None;
+                            }
                         }
                     };
-                    let inner_params = inner
-                        .as_ref()
-                        .map(|inner| inner.to_params())
-                        .unwrap_or_default();
-
-                    let id = RouteMatchId(self.id);
 
                     if remaining.is_empty() || remaining == "/" {
-                        params.extend(inner_params);
-                        Some((
-                            Some((
-                                id,
-                                NestedMatch {
-                                    id,
-                                    matched: matched.to_string(),
-                                    params,
-                                    child: inner,
-                                    view_fn: self.view.clone(),
-                                },
-                            )),
-                            remaining,
-                        ))
+                        // if this was an optional route, re-parse its params
+                        if was_optional_fallback {
+                            // new params are based on the path it matched (up to the point where the matched child begins)
+                            // e.g., if we have /:foo?/bar, for /bar we should *not* have { "foo": "bar" }
+                            // so, we re-parse based on "" to yield { "foo": "" }
+                            let matched = child
+                                .as_ref()
+                                .map_or("", Children::Match::as_matched);
+                            let rematch = path.trim_end_matches(&format!(
+                                "{matched}{remaining}"
+                            ));
+                            let new_partial = segments.test(rematch).unwrap();
+                            params = new_partial.params;
+                        }
+
+                        params.extend(
+                            child
+                                .as_ref()
+                                .map_or(Vec::new(), Children::Match::to_params),
+                        );
+                        Some((child, remaining, params))
                     } else {
                         None
                     }
-                },
-            )
+                }
+
+                |partial_match| {
+                    let (child, remaining, params) = inner(
+                        this_was_optional,
+                        path,
+                        partial_match.remaining,
+                        &self.segments,
+                        &self.children,
+                        partial_match.params,
+                    )?;
+                    let id = RouteMatchId(self.id);
+
+                    Some((
+                        Some((
+                            id,
+                            NestedMatch {
+                                id,
+                                matched: partial_match.matched.to_string(),
+                                params,
+                                child,
+                                view_fn: self.view.clone(),
+                            },
+                        )),
+                        remaining,
+                    ))
+                }
+            })
             .unwrap_or((None, path))
     }
 

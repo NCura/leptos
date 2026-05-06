@@ -56,12 +56,12 @@
 //!
 //! # if false { // don't run effect in doctests
 //! Effect::new(move |_| {
-//!     // you can access individual store withs field a getter
-//!     println!("todos: {:?}", &*store.todos().read());
+//!     // you can access individual store fields with a getter
+//!     println!("user: {:?}", &*store.user().read());
 //! });
 //! # }
 //!
-//! // won't notify the effect that listen to `todos`
+//! // won't notify the effect that listens to `user`
 //! store.todos().write().push(Todo {
 //!     label: "Test".to_string(),
 //!     completed: false,
@@ -69,7 +69,7 @@
 //! ```
 //! ### Generated traits
 //! The [`Store`](macro@Store) macro generates traits for each `struct` to which it is applied.  When working
-//! within a single file more module, this is not an issue.  However, when working with multiple modules
+//! within a single file or module, this is not an issue.  However, when working with multiple modules
 //! or files, one needs to `use` the generated traits.  The general pattern is that for each `struct`
 //! named `Foo`, the macro generates a trait named `FooStoreFields`.  For example:
 //! ```rust
@@ -98,7 +98,6 @@
 //! # fn main() {
 //! # }
 //! ```
-//! 
 //! ### Additional field types
 //!
 //! Most of the time, your structs will have fields as in the example above: the struct is comprised
@@ -141,7 +140,7 @@
 //! # use reactive_stores::Store;
 //! // Needed to use at_unkeyed() on Vec
 //! use reactive_stores::StoreFieldIter;
-//! use crate::reactive_stores::StoreFieldIterator;
+//! use reactive_stores::StoreFieldIterator;
 //! use reactive_graph::traits::Read;
 //! use reactive_graph::traits::Get;
 //!
@@ -256,7 +255,6 @@ pub use reactive_stores_macro::{Patch, Store};
 use rustc_hash::FxHashMap;
 use std::{
     any::Any,
-    collections::HashMap,
     fmt::Debug,
     hash::Hash,
     ops::DerefMut,
@@ -269,9 +267,14 @@ mod deref;
 mod field;
 mod iter;
 mod keyed;
+mod len;
 mod option;
 mod patch;
 mod path;
+#[cfg(feature = "serde")]
+mod serde;
+#[cfg(feature = "slotmap")]
+mod slotmap;
 mod store_field;
 mod subfield;
 
@@ -280,6 +283,7 @@ pub use deref::*;
 pub use field::Field;
 pub use iter::*;
 pub use keyed::*;
+pub use len::Len;
 pub use option::*;
 pub use patch::*;
 pub use path::{StorePath, StorePathSegment};
@@ -321,7 +325,7 @@ impl TriggerMap {
 }
 
 /// Manages the keys for a keyed field, including the ability to remove and reuse keys.
-pub(crate) struct FieldKeys<K> {
+pub struct FieldKeys<K> {
     spare_keys: Vec<StorePathSegment>,
     current_key: usize,
     keys: FxHashMap<K, (StorePathSegment, usize)>,
@@ -344,7 +348,7 @@ where
 
         Self {
             spare_keys: Vec::new(),
-            current_key: 0,
+            current_key: keys.len().saturating_sub(1),
             keys,
         }
     }
@@ -354,7 +358,15 @@ impl<K> FieldKeys<K>
 where
     K: Hash + PartialEq + Eq,
 {
-    fn get(&self, key: &K) -> Option<(StorePathSegment, usize)> {
+    /// Returns a copy of the path segment to the value identified by the key
+    ///
+    /// # Usage
+    ///
+    /// You shouldn't call this method from your code, since it's a part of
+    /// implementation details of `reactive_stores`. This method was exposed
+    /// to implement the derive `Patch` macro for keyed fields.
+    #[doc(hidden)]
+    pub fn get(&self, key: &K) -> Option<(StorePathSegment, usize)> {
         self.keys.get(key).copied()
     }
 
@@ -365,12 +377,17 @@ where
         })
     }
 
-    fn update(&mut self, iter: impl IntoIterator<Item = K>) {
+    fn update(
+        &mut self,
+        iter: impl IntoIterator<Item = K>,
+    ) -> Vec<(usize, StorePathSegment)> {
         let new_keys = iter
             .into_iter()
             .enumerate()
             .map(|(idx, key)| (key, idx))
             .collect::<FxHashMap<K, usize>>();
+
+        let mut index_keys = Vec::with_capacity(new_keys.len());
 
         // remove old keys and recycle the slots
         self.keys.retain(|key, old_entry| match new_keys.get(key) {
@@ -386,14 +403,17 @@ where
 
         // add new keys
         for (key, idx) in new_keys {
-            // the suggestion doesn't compile because we need &mut for self.next_key(),
-            // and we don't want to call that until after the check
-            #[allow(clippy::map_entry)]
-            if !self.keys.contains_key(&key) {
-                let path = self.next_key();
-                self.keys.insert(key, (path, idx));
+            match self.keys.get(&key) {
+                Some((segment, idx)) => index_keys.push((*idx, *segment)),
+                None => {
+                    let path = self.next_key();
+                    self.keys.insert(key, (path, idx));
+                    index_keys.push((idx, path));
+                }
             }
         }
+
+        index_keys
     }
 }
 
@@ -407,40 +427,99 @@ impl<K> Default for FieldKeys<K> {
     }
 }
 
+type Map<K, V> = Arc<std::sync::RwLock<std::collections::HashMap<K, V>>>;
+
 /// A map of the keys for a keyed subfield.
-#[derive(Default, Clone)]
-pub struct KeyMap(Arc<RwLock<HashMap<StorePath, Box<dyn Any + Send + Sync>>>>);
+#[derive(Clone, Default)]
+pub struct KeyMap(
+    /// Path to subfield -> Keys in keyed subfield
+    Map<StorePath, Box<dyn Any + Send + Sync>>,
+    /// Map index -> key
+    Map<(StorePath, usize), StorePathSegment>,
+);
 
 impl KeyMap {
-    fn with_field_keys<K, T>(
+    /// Transforms the keys related to the field identified by `path`.
+    ///
+    /// # Arguments
+    ///
+    /// - **path** - path to the field with collection
+    /// - **fun** - Transforms an instance of [FieldKeys] into the result
+    ///   
+    ///   ## Return value
+    ///
+    ///   callback should return a tuple ( result, new_keys)
+    ///
+    ///   - **result** - this value will be passed as a result
+    ///   - **new_keys** - is a vector of new keys to be added into reverse mapping
+    ///     (path, idx) -> (path segment) map
+    ///     
+    ///     ### Entries
+    ///
+    ///     Entry in the vector is a tuple (idx, segment) where
+    ///
+    ///     - **idx** - index of the element in the collection
+    ///     - **segment** - key of the element in the collection
+    ///     
+    /// - **initialize** - it is the set of keys with which to initialize the
+    ///   KeyMap for this field, if there aren't keys listed yet. In all cases
+    ///   inside the library this is `|| self.latest_keys()` or `|| self.inner.latest_keys()`
+    ///
+    ///   This function will be called **only** if KeyMap doesn't have entry for
+    ///   `path`.
+    ///
+    ///   ## Returns
+    ///
+    ///   A vector of keys which will be used if KeyMap doesn't have an entry for
+    ///   given `path`
+    ///
+    /// # Returns
+    ///
+    /// - [None] if path doesn't point to the keyed field
+    /// - **result** value returned from `fun` callback
+    ///
+    /// # Usage
+    ///
+    /// You should not call this method directly from your code, as it's
+    /// an implementation detail of `reactive_stores`. This method was exposed
+    /// to implement the derive `Patch` macro for keyed fields.
+    #[doc(hidden)]
+    pub fn with_field_keys<K, T>(
         &self,
         path: StorePath,
-        fun: impl FnOnce(&mut FieldKeys<K>) -> T,
+        fun: impl FnOnce(&mut FieldKeys<K>) -> (T, Vec<(usize, StorePathSegment)>),
         initialize: impl FnOnce() -> Vec<K>,
     ) -> Option<T>
     where
         K: Debug + Hash + PartialEq + Eq + Send + Sync + 'static,
     {
-        // this incredibly defensive mechanism takes the guard twice
-        // on initialization. unfortunately, this is because `initialize`, on
-        // a nested keyed field can, when being initialized), can in fact try
-        // to take the lock again, as we try to insert the keys of the parent
-        // while inserting the keys on this child.
-        //
-        // see here https://github.com/leptos-rs/leptos/issues/3086
         let mut guard = self.0.write().or_poisoned();
-        if guard.contains_key(&path) {
-            let entry = guard.get_mut(&path)?;
-            let entry = entry.downcast_mut::<FieldKeys<K>>()?;
-            Some(fun(entry))
-        } else {
-            drop(guard);
-            let keys = Box::new(FieldKeys::new(initialize()));
-            let mut guard = self.0.write().or_poisoned();
-            let entry = guard.entry(path).or_insert(keys);
-            let entry = entry.downcast_mut::<FieldKeys<K>>()?;
-            Some(fun(entry))
+        let entry = guard
+            .entry(path.clone())
+            .or_insert_with(|| Box::new(FieldKeys::new(initialize())));
+
+        let entry = entry.downcast_mut::<FieldKeys<K>>()?;
+        let (result, new_keys) = fun(entry);
+        if !new_keys.is_empty() {
+            for (idx, segment) in new_keys {
+                self.1
+                    .write()
+                    .or_poisoned()
+                    .insert((path.clone(), idx), segment);
+            }
         }
+        Some(result)
+    }
+
+    fn contains_key(&self, key: &StorePath) -> bool {
+        self.0.read().or_poisoned().contains_key(key)
+    }
+
+    fn get_key_for_index(
+        &self,
+        key: &(StorePath, usize),
+    ) -> Option<StorePathSegment> {
+        self.1.read().or_poisoned().get(key).copied()
     }
 }
 
@@ -594,6 +673,14 @@ where
     }
 }
 
+impl<T, S> PartialEq for Store<T, S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl<T, S> Eq for Store<T, S> {}
+
 impl<T> Store<T, LocalStorage>
 where
     T: 'static,
@@ -745,7 +832,7 @@ where
 {
     fn from(value: ArcStore<T>) -> Self {
         Self {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: value.defined_at,
             inner: ArenaItem::new_with_storage(value),
         }
@@ -758,7 +845,7 @@ mod tests {
     use reactive_graph::{
         effect::Effect,
         owner::StoredValue,
-        traits::{Read, ReadUntracked, Set, Update, Write},
+        traits::{Read, ReadUntracked, Set, Track, Update, Write},
     };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -808,6 +895,30 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[derive(Debug, Clone, Store, Patch, Default)]
+    struct Foo {
+        id: i32,
+        bar: Bar,
+    }
+
+    #[derive(Debug, Clone, Store, Patch, Default)]
+    struct Bar {
+        bar_signature: i32,
+        baz: Baz,
+    }
+
+    #[derive(Debug, Clone, Store, Patch, Default)]
+    struct Baz {
+        more_data: i32,
+        baw: Baw,
+    }
+
+    #[derive(Debug, Clone, Store, Patch, Default)]
+    struct Baw {
+        more_data: i32,
+        end: i32,
     }
 
     #[tokio::test]
@@ -863,7 +974,6 @@ mod tests {
                 combined_count.fetch_add(1, Ordering::Relaxed);
             }
         });
-        tick().await;
         tick().await;
         store.user().set("Greg".into());
         tick().await;
@@ -1024,6 +1134,8 @@ mod tests {
 
     #[tokio::test]
     async fn patching_only_notifies_changed_field_with_custom_patch() {
+        _ = any_spawner::Executor::init_tokio();
+
         #[derive(Debug, Store, Patch, Default)]
         struct CustomTodos {
             #[patch(|this, new| *this = new)]
@@ -1036,8 +1148,6 @@ mod tests {
             label: String,
             completed: bool,
         }
-
-        _ = any_spawner::Executor::init_tokio();
 
         let combined_count = Arc::new(AtomicUsize::new(0));
 
@@ -1084,40 +1194,12 @@ mod tests {
         assert_eq!(combined_count.load(Ordering::Relaxed), 3);
     }
 
-    #[derive(Debug, Store)]
-    pub struct StructWithOption {
-        opt_field: Option<Todo>,
-    }
-
     // regression test for https://github.com/leptos-rs/leptos/issues/3523
     #[tokio::test]
     async fn notifying_all_descendants() {
         use reactive_graph::traits::*;
+
         _ = any_spawner::Executor::init_tokio();
-
-        #[derive(Debug, Clone, Store, Patch, Default)]
-        struct Foo {
-            id: i32,
-            bar: Bar,
-        }
-
-        #[derive(Debug, Clone, Store, Patch, Default)]
-        struct Bar {
-            bar_signature: i32,
-            baz: Baz,
-        }
-
-        #[derive(Debug, Clone, Store, Patch, Default)]
-        struct Baz {
-            more_data: i32,
-            baw: Baw,
-        }
-
-        #[derive(Debug, Clone, Store, Patch, Default)]
-        struct Baw {
-            more_data: i32,
-            end: i32,
-        }
 
         let store = Store::new(Foo {
             id: 42,
@@ -1201,5 +1283,138 @@ mod tests {
         assert_eq!(bar_baz_runs.get_value(), 3);
         assert_eq!(more_data_runs.get_value(), 3);
         assert_eq!(baz_baw_end_runs.get_value(), 3);
+    }
+
+    #[tokio::test]
+    async fn changing_parent_notifies_subfield() {
+        _ = any_spawner::Executor::init_tokio();
+
+        let combined_count = Arc::new(AtomicUsize::new(0));
+
+        let store = Store::new(Foo {
+            id: 42,
+            bar: Bar {
+                bar_signature: 69,
+                baz: Baz {
+                    more_data: 9999,
+                    baw: Baw {
+                        more_data: 22,
+                        end: 1112,
+                    },
+                },
+            },
+        });
+
+        let tracked_field = store.bar().baz().more_data();
+
+        Effect::new_sync({
+            let combined_count = Arc::clone(&combined_count);
+            move |prev: Option<()>| {
+                if prev.is_none() {
+                    println!("first run");
+                } else {
+                    println!("next run");
+                }
+
+                // we only track `more`, but this should still be notified
+                // when its parent fields `bar` or `baz` change
+                println!("{:?}", *tracked_field.read());
+                combined_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        tick().await;
+        tick().await;
+
+        store.bar().baz().set(Baz {
+            more_data: 42,
+            baw: Baw {
+                more_data: 11,
+                end: 31,
+            },
+        });
+        tick().await;
+        store.bar().set(Bar {
+            bar_signature: 23,
+            baz: Baz {
+                more_data: 32,
+                baw: Baw {
+                    more_data: 432,
+                    end: 423,
+                },
+            },
+        });
+        tick().await;
+
+        assert_eq!(combined_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn changing_parent_notifies_unkeyed_child() {
+        _ = any_spawner::Executor::init_tokio();
+
+        let combined_count = Arc::new(AtomicUsize::new(0));
+
+        let store = Store::new(data());
+
+        let tracked_field = store.todos().at_unkeyed(0);
+
+        Effect::new_sync({
+            let combined_count = Arc::clone(&combined_count);
+            move |prev: Option<()>| {
+                if prev.is_none() {
+                    println!("first run");
+                } else {
+                    println!("next run");
+                }
+
+                // we only track `more`, but this should still be notified
+                // when its parent fields `bar` or `baz` change
+                println!("{:?}", *tracked_field.read());
+                combined_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        tick().await;
+        tick().await;
+
+        store.todos().write().pop();
+        tick().await;
+
+        store.todos().write().push(Todo {
+            label: "another one".into(),
+            completed: false,
+        });
+        tick().await;
+
+        assert_eq!(combined_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn untracked_write_on_subfield_shouldnt_notify() {
+        _ = any_spawner::Executor::init_tokio();
+
+        let name_count = Arc::new(AtomicUsize::new(0));
+
+        let store = Store::new(data());
+
+        let tracked_field = store.user();
+
+        Effect::new_sync({
+            let name_count = Arc::clone(&name_count);
+            move |_| {
+                tracked_field.track();
+                name_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tick().await;
+        assert_eq!(name_count.load(Ordering::Relaxed), 1);
+
+        tracked_field.write().push('!');
+        tick().await;
+        assert_eq!(name_count.load(Ordering::Relaxed), 2);
+
+        tracked_field.write_untracked().push('!');
+        tick().await;
+        assert_eq!(name_count.load(Ordering::Relaxed), 2);
     }
 }

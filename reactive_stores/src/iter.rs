@@ -1,4 +1,5 @@
 use crate::{
+    len::Len,
     path::{StorePath, StorePathSegment},
     store_field::StoreField,
     KeyMap, StoreFieldTrigger,
@@ -79,8 +80,19 @@ where
             .chain(iter::once(self.index.into()))
     }
 
+    fn path_unkeyed(&self) -> impl IntoIterator<Item = StorePathSegment> {
+        self.inner
+            .path_unkeyed()
+            .into_iter()
+            .chain(iter::once(self.index.into()))
+    }
+
     fn get_trigger(&self, path: StorePath) -> StoreFieldTrigger {
         self.inner.get_trigger(path)
+    }
+
+    fn get_trigger_unkeyed(&self, path: StorePath) -> StoreFieldTrigger {
+        self.inner.get_trigger_unkeyed(path)
     }
 
     fn reader(&self) -> Option<Self::Reader> {
@@ -107,6 +119,23 @@ where
     #[inline(always)]
     fn keys(&self) -> Option<KeyMap> {
         self.inner.keys()
+    }
+
+    fn track_field(&self) {
+        let mut full_path = self.path().into_iter().collect::<StorePath>();
+        let trigger = self.get_trigger(self.path().into_iter().collect());
+        trigger.this.track();
+        trigger.children.track();
+
+        // tracks `this` for all ancestors: i.e., it will track any change that is made
+        // directly to one of its ancestors, but not a change made to a *child* of an ancestor
+        // (which would end up with every subfield tracking its own siblings, because they are
+        // children of its parent)
+        while !full_path.is_empty() {
+            full_path.pop();
+            let inner = self.get_trigger(full_path.clone());
+            inner.this.track();
+        }
     }
 }
 
@@ -209,7 +238,7 @@ impl<Inner, Prev> StoreFieldIterator<Prev> for Inner
 where
     Inner: StoreField<Value = Prev> + Clone,
     Prev::Output: Sized,
-    Prev: IndexMut<usize> + AsRef<[Prev::Output]>,
+    Prev: IndexMut<usize> + Len,
 {
     #[track_caller]
     fn at_unkeyed(self, index: usize) -> AtIndex<Inner, Prev> {
@@ -224,7 +253,7 @@ where
         trigger.children.track();
 
         // get the current length of the field by accessing slice
-        let len = self.reader().map(|n| n.as_ref().len()).unwrap_or(0);
+        let len = self.reader().map(|n| n.len()).unwrap_or(0);
 
         // return the iterator
         StoreFieldIter {

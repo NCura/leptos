@@ -1,4 +1,7 @@
-use super::{convert_to_snake_case, ident_from_tag_name};
+use super::{
+    component_builder::maybe_optimised_component_children,
+    convert_to_snake_case, full_path_from_tag_name,
+};
 use crate::view::{fragment_to_tokens, utils::filter_prefixed_attrs, TagType};
 use proc_macro2::{Ident, TokenStream, TokenTree};
 use quote::{quote, quote_spanned};
@@ -21,7 +24,7 @@ pub(crate) fn slot_to_tokens(
         node.name().to_string()
     });
 
-    let component_name = ident_from_tag_name(node.name());
+    let component_path = full_path_from_tag_name(node.name());
 
     let Some(parent_slots) = parent_slots else {
         proc_macro_error2::emit_error!(
@@ -70,7 +73,10 @@ pub(crate) fn slot_to_tokens(
             }
         });
 
-    let items_to_bind = filter_prefixed_attrs(attrs.iter(), "let:");
+    let items_to_bind = filter_prefixed_attrs(attrs.iter(), "let:")
+        .into_iter()
+        .map(|ident| quote! { #ident })
+        .collect::<Vec<_>>();
 
     let items_to_clone = filter_prefixed_attrs(attrs.iter(), "clone:");
 
@@ -83,7 +89,7 @@ pub(crate) fn slot_to_tokens(
             let value = attr.value().map(|v| {
                 quote! { #v }
             })?;
-            Some(quote! { (#name, ::leptos::IntoAttribute::into_attribute(#value)) })
+            Some(quote! { (#name, #value) })
         })
         .collect::<Vec<_>>();
 
@@ -96,6 +102,12 @@ pub(crate) fn slot_to_tokens(
     let mut slots = HashMap::new();
     let children = if node.children.is_empty() {
         quote! {}
+    } else if let Some(children) = maybe_optimised_component_children(
+        &node.children,
+        &items_to_bind,
+        &items_to_clone,
+    ) {
+        children
     } else {
         let children = fragment_to_tokens(
             &mut node.children,
@@ -178,7 +190,7 @@ pub(crate) fn slot_to_tokens(
 
     let slot = quote_spanned! {node.span()=>
         {
-            let slot = #component_name::builder()
+            let slot = #component_path::builder()
                 #(#props)*
                 #(#slots)*
                 #children

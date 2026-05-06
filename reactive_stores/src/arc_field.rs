@@ -1,7 +1,7 @@
 use crate::{
     path::{StorePath, StorePathSegment},
-    ArcStore, AtIndex, AtKeyed, DerefedField, KeyMap, KeyedSubfield, Store,
-    StoreField, StoreFieldTrigger, Subfield,
+    ArcStore, AtIndex, AtKeyed, DerefedField, KeyMap, KeyedAccess,
+    KeyedSubfield, Store, StoreField, StoreFieldTrigger, Subfield,
 };
 use reactive_graph::{
     owner::Storage,
@@ -28,14 +28,17 @@ where
 {
     #[cfg(any(debug_assertions, leptos_debuginfo))]
     defined_at: &'static Location<'static>,
-    path: StorePath,
-    trigger: StoreFieldTrigger,
+    path: Arc<dyn Fn() -> StorePath + Send + Sync>,
+    path_unkeyed: Arc<dyn Fn() -> StorePath + Send + Sync>,
     get_trigger: Arc<dyn Fn(StorePath) -> StoreFieldTrigger + Send + Sync>,
+    get_trigger_unkeyed:
+        Arc<dyn Fn(StorePath) -> StoreFieldTrigger + Send + Sync>,
     read: Arc<dyn Fn() -> Option<StoreFieldReader<T>> + Send + Sync>,
     pub(crate) write:
         Arc<dyn Fn() -> Option<StoreFieldWriter<T>> + Send + Sync>,
     keys: Arc<dyn Fn() -> Option<KeyMap> + Send + Sync>,
     track_field: Arc<dyn Fn() + Send + Sync>,
+    notify: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl<T> Debug for ArcField<T>
@@ -46,9 +49,7 @@ where
         let mut f = f.debug_struct("ArcField");
         #[cfg(any(debug_assertions, leptos_debuginfo))]
         let f = f.field("defined_at", &self.defined_at);
-        f.field("path", &self.path)
-            .field("trigger", &self.trigger)
-            .finish()
+        f.finish_non_exhaustive()
     }
 }
 
@@ -105,8 +106,16 @@ impl<T> StoreField for ArcField<T> {
         (self.get_trigger)(path)
     }
 
+    fn get_trigger_unkeyed(&self, path: StorePath) -> StoreFieldTrigger {
+        (self.get_trigger_unkeyed)(path)
+    }
+
     fn path(&self) -> impl IntoIterator<Item = StorePathSegment> {
-        self.path.clone()
+        (self.path)()
+    }
+
+    fn path_unkeyed(&self) -> impl IntoIterator<Item = StorePathSegment> {
+        (self.path_unkeyed)()
     }
 
     fn reader(&self) -> Option<Self::Reader> {
@@ -132,13 +141,19 @@ where
         ArcField {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
-            path: value.path().into_iter().collect(),
-            trigger: value.get_trigger(value.path().into_iter().collect()),
+            path: Arc::new(move || value.path().into_iter().collect()),
+            path_unkeyed: Arc::new(move || {
+                value.path_unkeyed().into_iter().collect()
+            }),
             get_trigger: Arc::new(move |path| value.get_trigger(path)),
+            get_trigger_unkeyed: Arc::new(move |path| {
+                value.get_trigger_unkeyed(path)
+            }),
             read: Arc::new(move || value.reader().map(StoreFieldReader::new)),
             write: Arc::new(move || value.writer().map(StoreFieldWriter::new)),
             keys: Arc::new(move || value.keys()),
             track_field: Arc::new(move || value.track_field()),
+            notify: Arc::new(move || value.notify()),
         }
     }
 }
@@ -152,11 +167,21 @@ where
         ArcField {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
-            path: value.path().into_iter().collect(),
-            trigger: value.get_trigger(value.path().into_iter().collect()),
+            path: Arc::new({
+                let value = value.clone();
+                move || value.path().into_iter().collect()
+            }),
+            path_unkeyed: Arc::new({
+                let value = value.clone();
+                move || value.path_unkeyed().into_iter().collect()
+            }),
             get_trigger: Arc::new({
                 let value = value.clone();
                 move |path| value.get_trigger(path)
+            }),
+            get_trigger_unkeyed: Arc::new({
+                let value = value.clone();
+                move |path| value.get_trigger_unkeyed(path)
             }),
             read: Arc::new({
                 let value = value.clone();
@@ -173,6 +198,10 @@ where
             track_field: Arc::new({
                 let value = value.clone();
                 move || value.track_field()
+            }),
+            notify: Arc::new({
+                let value = value.clone();
+                move || value.notify()
             }),
         }
     }
@@ -190,11 +219,21 @@ where
         ArcField {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
-            path: value.path().into_iter().collect(),
-            trigger: value.get_trigger(value.path().into_iter().collect()),
+            path: Arc::new({
+                let value = value.clone();
+                move || value.path().into_iter().collect()
+            }),
+            path_unkeyed: Arc::new({
+                let value = value.clone();
+                move || value.path_unkeyed().into_iter().collect()
+            }),
             get_trigger: Arc::new({
                 let value = value.clone();
                 move |path| value.get_trigger(path)
+            }),
+            get_trigger_unkeyed: Arc::new({
+                let value = value.clone();
+                move |path| value.get_trigger_unkeyed(path)
             }),
             read: Arc::new({
                 let value = value.clone();
@@ -211,6 +250,10 @@ where
             track_field: Arc::new({
                 let value = value.clone();
                 move || value.track_field()
+            }),
+            notify: Arc::new({
+                let value = value.clone();
+                move || value.notify()
             }),
         }
     }
@@ -227,11 +270,21 @@ where
         ArcField {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
-            path: value.path().into_iter().collect(),
-            trigger: value.get_trigger(value.path().into_iter().collect()),
+            path: Arc::new({
+                let value = value.clone();
+                move || value.path().into_iter().collect()
+            }),
+            path_unkeyed: Arc::new({
+                let value = value.clone();
+                move || value.path_unkeyed().into_iter().collect()
+            }),
             get_trigger: Arc::new({
                 let value = value.clone();
                 move |path| value.get_trigger(path)
+            }),
+            get_trigger_unkeyed: Arc::new({
+                let value = value.clone();
+                move |path| value.get_trigger_unkeyed(path)
             }),
             read: Arc::new({
                 let value = value.clone();
@@ -248,6 +301,10 @@ where
             track_field: Arc::new({
                 let value = value.clone();
                 move || value.track_field()
+            }),
+            notify: Arc::new({
+                let value = value.clone();
+                move || value.notify()
             }),
         }
     }
@@ -265,11 +322,21 @@ where
         ArcField {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
-            path: value.path().into_iter().collect(),
-            trigger: value.get_trigger(value.path().into_iter().collect()),
+            path: Arc::new({
+                let value = value.clone();
+                move || value.path().into_iter().collect()
+            }),
+            path_unkeyed: Arc::new({
+                let value = value.clone();
+                move || value.path_unkeyed().into_iter().collect()
+            }),
             get_trigger: Arc::new({
                 let value = value.clone();
                 move |path| value.get_trigger(path)
+            }),
+            get_trigger_unkeyed: Arc::new({
+                let value = value.clone();
+                move |path| value.get_trigger_unkeyed(path)
             }),
             read: Arc::new({
                 let value = value.clone();
@@ -287,31 +354,45 @@ where
                 let value = value.clone();
                 move || value.track_field()
             }),
+            notify: Arc::new({
+                let value = value.clone();
+                move || value.notify()
+            }),
         }
     }
 }
 
-impl<Inner, Prev, K, T> From<AtKeyed<Inner, Prev, K, T>> for ArcField<T::Output>
+impl<Inner, Prev, K, T> From<AtKeyed<Inner, Prev, K, T>> for ArcField<T::Value>
 where
     AtKeyed<Inner, Prev, K, T>: Clone,
-    K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
     for<'a> &'a T: IntoIterator,
     Inner: StoreField<Value = Prev> + Send + Sync + 'static,
     Prev: 'static,
-    T: IndexMut<usize> + 'static,
-    T::Output: Sized,
+    T: KeyedAccess<K> + 'static,
+    T::Value: Sized,
 {
     #[track_caller]
     fn from(value: AtKeyed<Inner, Prev, K, T>) -> Self {
         ArcField {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
-            path: value.path().into_iter().collect(),
-            trigger: value.get_trigger(value.path().into_iter().collect()),
+            path: Arc::new({
+                let value = value.clone();
+                move || value.path().into_iter().collect()
+            }),
+            path_unkeyed: Arc::new({
+                let value = value.clone();
+                move || value.path_unkeyed().into_iter().collect()
+            }),
             get_trigger: Arc::new({
                 let value = value.clone();
                 move |path| value.get_trigger(path)
+            }),
+            get_trigger_unkeyed: Arc::new({
+                let value = value.clone();
+                move |path| value.get_trigger_unkeyed(path)
             }),
             read: Arc::new({
                 let value = value.clone();
@@ -328,6 +409,10 @@ where
             track_field: Arc::new({
                 let value = value.clone();
                 move || value.track_field()
+            }),
+            notify: Arc::new({
+                let value = value.clone();
+                move || value.notify()
             }),
         }
     }
@@ -339,12 +424,14 @@ impl<T> Clone for ArcField<T> {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: self.defined_at,
             path: self.path.clone(),
-            trigger: self.trigger.clone(),
+            path_unkeyed: self.path_unkeyed.clone(),
             get_trigger: Arc::clone(&self.get_trigger),
+            get_trigger_unkeyed: Arc::clone(&self.get_trigger_unkeyed),
             read: Arc::clone(&self.read),
             write: Arc::clone(&self.write),
             keys: Arc::clone(&self.keys),
             track_field: Arc::clone(&self.track_field),
+            notify: Arc::clone(&self.notify),
         }
     }
 }
@@ -364,7 +451,7 @@ impl<T> DefinedAt for ArcField<T> {
 
 impl<T> Notify for ArcField<T> {
     fn notify(&self) {
-        self.trigger.this.notify();
+        (self.notify)()
     }
 }
 

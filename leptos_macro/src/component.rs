@@ -3,6 +3,7 @@ use convert_case::{
     Case::{Pascal, Snake},
     Casing,
 };
+use convert_case_extras::is_case;
 use itertools::Itertools;
 use leptos_hot_reload::parsing::value_to_string;
 use proc_macro2::{Ident, Span, TokenStream};
@@ -19,6 +20,7 @@ use syn::{
 
 pub struct Model {
     is_transparent: bool,
+    is_lazy: bool,
     island: Option<String>,
     docs: Docs,
     unknown_attrs: UnknownAttrs,
@@ -32,6 +34,8 @@ pub struct Model {
 impl Parse for Model {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut item = ItemFn::parse(input)?;
+        maybe_modify_return_type(&mut item.sig.output);
+
         convert_impl_trait_to_generic(&mut item.sig);
 
         let docs = Docs::new(&item.attrs);
@@ -64,6 +68,7 @@ impl Parse for Model {
 
         Ok(Self {
             is_transparent: false,
+            is_lazy: false,
             island: None,
             docs,
             unknown_attrs,
@@ -73,6 +78,39 @@ impl Parse for Model {
             ret: item.sig.output.clone(),
             body: item,
         })
+    }
+}
+
+/// Exists to fix nested routes defined in a separate component in erased mode,
+/// by replacing the return type with AnyNestedRoute, which is what it'll be, but is required as the return type for compiler inference.
+fn maybe_modify_return_type(ret: &mut ReturnType) {
+    #[cfg(feature = "__internal_erase_components")]
+    {
+        if let ReturnType::Type(_, ty) = ret {
+            if let Type::ImplTrait(TypeImplTrait { bounds, .. }) = ty.as_ref() {
+                // If one of the bounds is MatchNestedRoutes, we need to replace the return type with AnyNestedRoute:
+                if bounds.iter().any(|bound| {
+                    if let syn::TypeParamBound::Trait(trait_bound) = bound {
+                        if trait_bound.path.segments.iter().any(
+                            |path_segment| {
+                                path_segment.ident == "MatchNestedRoutes"
+                            },
+                        ) {
+                            return true;
+                        }
+                    }
+                    false
+                }) {
+                    *ty = parse_quote!(
+                        ::leptos_router::any_nested_route::AnyNestedRoute
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "__internal_erase_components"))]
+    {
+        let _ = ret;
     }
 }
 
@@ -94,7 +132,7 @@ pub fn drain_filter<T>(
 
 pub fn convert_from_snake_case(name: &Ident) -> Ident {
     let name_str = name.to_string();
-    if !name_str.is_case(Snake) {
+    if !is_case(&name_str, Snake) {
         name.clone()
     } else {
         Ident::new(&name_str.to_case(Pascal), name.span())
@@ -105,6 +143,7 @@ impl ToTokens for Model {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let Self {
             is_transparent,
+            is_lazy,
             island,
             docs,
             unknown_attrs,
@@ -296,9 +335,9 @@ impl ToTokens for Model {
 
         let component = if *is_transparent {
             body_expr
-        } else if cfg!(erase_components) {
+        } else if cfg!(feature = "__internal_erase_components") {
             quote! {
-                ::leptos::prelude::IntoAny::into_any(
+                ::leptos::prelude::IntoMaybeErased::into_maybe_erased(
                     ::leptos::reactive::graph::untrack_with_diagnostics(
                         move || {
                             #tracing_guard_expr
@@ -324,23 +363,11 @@ impl ToTokens for Model {
         let component = if is_island {
             let hydrate_fn_name = hydrate_fn_name.as_ref().unwrap();
             quote! {
-                {
-                    if ::leptos::context::use_context::<::leptos::reactive::owner::IsHydrating>()
-                        .map(|h| h.0)
-                        .unwrap_or(false) {
-                        ::leptos::either::Either::Left(
-                            #component
-                        )
-                    } else {
-                        ::leptos::either::Either::Right(
-                            ::leptos::tachys::html::islands::Island::new(
-                                stringify!(#hydrate_fn_name),
-                                #component
-                            )
-                             #island_serialized_props
-                        )
-                    }
-                }
+                ::leptos::tachys::html::islands::Island::new(
+                    stringify!(#hydrate_fn_name),
+                    #component
+                )
+                #island_serialized_props
             }
         } else {
             component
@@ -507,15 +534,41 @@ impl ToTokens for Model {
             };
 
             let hydrate_fn_name = hydrate_fn_name.as_ref().unwrap();
-            quote! {
-                #[::leptos::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::leptos::wasm_bindgen)]
-                #[allow(non_snake_case)]
-                pub fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
-                    #deserialize_island_props
-                    let island = #name(#island_props);
-                    let state = island.hydrate_from_position::<true>(&el, ::leptos::tachys::view::Position::Current);
-                    // TODO better cleanup
-                    std::mem::forget(state);
+
+            let hydrate_fn_inner = quote! {
+                #deserialize_island_props
+                let island = #name(#island_props);
+                let state = island.hydrate_from_position::<true>(&el, ::leptos::tachys::view::Position::Current);
+                // TODO better cleanup
+                std::mem::forget(state);
+            };
+            if *is_lazy {
+                let outer_name =
+                    Ident::new(&format!("{name}_loader"), name.span());
+
+                quote! {
+                    #[::leptos::prelude::lazy]
+                    #[allow(non_snake_case)]
+                    fn #outer_name (el: ::leptos::web_sys::HtmlElement) {
+                        #hydrate_fn_inner
+                    }
+
+                    #[::leptos::wasm_bindgen::prelude::wasm_bindgen(
+                        wasm_bindgen = ::leptos::wasm_bindgen,
+                        wasm_bindgen_futures = ::leptos::__reexports::wasm_bindgen_futures
+                    )]
+                    #[allow(non_snake_case)]
+                    pub async fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
+                        #outer_name(el).await
+                    }
+                }
+            } else {
+                quote! {
+                    #[::leptos::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::leptos::wasm_bindgen)]
+                    #[allow(non_snake_case)]
+                    pub fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
+                        #hydrate_fn_inner
+                    }
                 }
             }
         } else {
@@ -588,6 +641,13 @@ impl Model {
     }
 
     #[allow(clippy::wrong_self_convention)]
+    pub fn is_lazy(mut self, is_lazy: bool) -> Self {
+        self.is_lazy = is_lazy;
+
+        self
+    }
+
+    #[allow(clippy::wrong_self_convention)]
     pub fn with_island(mut self, island: Option<String>) -> Self {
         self.island = island;
 
@@ -610,10 +670,13 @@ impl Parse for DummyModel {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut attrs = input.call(Attribute::parse_outer)?;
         // Drop unknown attributes like #[deprecated]
-        drain_filter(&mut attrs, |attr| !attr.path().is_ident("doc"));
+        drain_filter(&mut attrs, |attr| {
+            !is_lint_attr(attr) && !attr.path().is_ident("doc")
+        });
 
         let vis: Visibility = input.parse()?;
-        let sig: Signature = input.parse()?;
+        let mut sig: Signature = input.parse()?;
+        maybe_modify_return_type(&mut sig.output);
 
         // The body is left untouched, so it will not cause an error
         // even if the syntax is invalid.
@@ -890,6 +953,15 @@ impl Docs {
     }
 }
 
+fn is_lint_attr(attr: &Attribute) -> bool {
+    let path = &attr.path();
+    path.is_ident("allow")
+        || path.is_ident("warn")
+        || path.is_ident("expect")
+        || path.is_ident("deny")
+        || path.is_ident("forbid")
+}
+
 pub struct UnknownAttrs(Vec<(TokenStream, Span)>);
 
 impl UnknownAttrs {
@@ -901,6 +973,10 @@ impl UnknownAttrs {
                     if let Meta::NameValue(_) = &attr.meta {
                         return None;
                     }
+                }
+
+                if is_lint_attr(attr) {
+                    return None;
                 }
 
                 Some((attr.into_token_stream(), attr.span()))
@@ -937,25 +1013,27 @@ struct PropOpt {
     name: Option<String>,
 }
 
-struct TypedBuilderOpts {
+struct TypedBuilderOpts<'a> {
     default: bool,
     default_with_value: Option<syn::Expr>,
     strip_option: bool,
     into: bool,
+    ty: &'a Type,
 }
 
-impl TypedBuilderOpts {
-    fn from_opts(opts: &PropOpt, is_ty_option: bool) -> Self {
+impl<'a> TypedBuilderOpts<'a> {
+    fn from_opts(opts: &PropOpt, ty: &'a Type) -> Self {
         Self {
             default: opts.optional || opts.optional_no_strip || opts.attrs,
             default_with_value: opts.default.clone(),
-            strip_option: opts.strip_option || opts.optional && is_ty_option,
+            strip_option: opts.strip_option || opts.optional && is_option(ty),
             into: opts.into,
+            ty,
         }
     }
 }
 
-impl TypedBuilderOpts {
+impl TypedBuilderOpts<'_> {
     fn to_serde_tokens(&self) -> TokenStream {
         let default = if let Some(v) = &self.default_with_value {
             let v = v.to_token_stream().to_string();
@@ -974,7 +1052,7 @@ impl TypedBuilderOpts {
     }
 }
 
-impl ToTokens for TypedBuilderOpts {
+impl ToTokens for TypedBuilderOpts<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let default = if let Some(v) = &self.default_with_value {
             let v = v.to_token_stream().to_string();
@@ -985,14 +1063,29 @@ impl ToTokens for TypedBuilderOpts {
             quote! {}
         };
 
-        let strip_option = if self.strip_option {
+        // If self.strip_option && self.into, then the strip_option will be represented as part of the transform closure.
+        let strip_option = if self.strip_option && !self.into {
             quote! { strip_option, }
         } else {
             quote! {}
         };
 
         let into = if self.into {
-            quote! { into, }
+            if !self.strip_option {
+                let ty = &self.ty;
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> #ty {
+                        value.into_reactive_value()
+                    },
+                }
+            } else {
+                let ty = unwrap_option(self.ty);
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> Option<#ty> {
+                        Some(value.into_reactive_value())
+                    },
+                }
+            }
         } else {
             quote! {}
         };
@@ -1028,8 +1121,7 @@ fn prop_builder_fields(
                 ty,
             } = prop;
 
-            let builder_attrs =
-                TypedBuilderOpts::from_opts(prop_opts, is_option(ty));
+            let builder_attrs = TypedBuilderOpts::from_opts(prop_opts, ty);
 
             let builder_docs = prop_to_doc(prop, PropDocStyle::Inline);
 
@@ -1074,8 +1166,7 @@ fn prop_serializer_fields(vis: &Visibility, props: &[Prop]) -> TokenStream {
                     ty,
                 } = prop;
 
-                let builder_attrs =
-                    TypedBuilderOpts::from_opts(prop_opts, is_option(ty));
+                let builder_attrs = TypedBuilderOpts::from_opts(prop_opts, ty);
                 let serde_attrs = builder_attrs.to_serde_tokens();
 
                 let PatIdent { ident, by_ref, .. } = &name;
@@ -1281,7 +1372,10 @@ fn prop_to_doc(
 }
 
 pub fn unmodified_fn_name_from_fn_name(ident: &Ident) -> Ident {
-    Ident::new(&format!("__{ident}"), ident.span())
+    Ident::new(
+        &format!("__component_{}", ident.to_string().to_case(Snake)),
+        ident.span(),
+    )
 }
 
 /// Converts all `impl Trait`s in a function signature to use generic params instead.

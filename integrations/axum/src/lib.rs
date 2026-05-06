@@ -47,8 +47,6 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
 };
-#[cfg(feature = "default")]
-use dashmap::DashMap;
 use futures::{stream::once, Future, Stream, StreamExt};
 use hydration_context::SsrSharedContext;
 use leptos::{
@@ -69,18 +67,29 @@ use leptos_router::{
     static_routes::RegenerationFn, ExpandOptionals, PathSegment, RouteList,
     RouteListing, SsrMode,
 };
+use or_poisoned::OrPoisoned;
+use server_fn::{error::ServerFnErrorErr, redirect::REDIRECT_HEADER};
 #[cfg(feature = "default")]
-use once_cell::sync::Lazy;
-use parking_lot::RwLock;
-use server_fn::{redirect::REDIRECT_HEADER, ServerFnError};
+use std::sync::LazyLock;
 #[cfg(feature = "default")]
-use std::path::Path;
-use std::{collections::HashSet, fmt::Debug, io, pin::Pin, sync::Arc};
+use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashSet,
+    fmt::Debug,
+    io,
+    pin::Pin,
+    sync::{Arc, RwLock},
+};
 #[cfg(feature = "default")]
 use tower::util::ServiceExt;
 #[cfg(feature = "default")]
 use tower_http::services::ServeDir;
 // use tracing::Instrument; // TODO check tracing span -- was this used in 0.6 for a missing link?
+
+#[cfg(feature = "default")]
+mod service;
+#[cfg(feature = "default")]
+pub use service::ErrorHandler;
 
 /// This struct lets you define headers and override the status of the Response from an Element or a Server Function
 /// Typically contained inside of a ResponseOptions. Setting this is useful for cookies and custom responses.
@@ -126,24 +135,24 @@ pub struct ResponseOptions(pub Arc<RwLock<ResponseParts>>);
 impl ResponseOptions {
     /// A simpler way to overwrite the contents of `ResponseOptions` with a new `ResponseParts`.
     pub fn overwrite(&self, parts: ResponseParts) {
-        let mut writable = self.0.write();
+        let mut writable = self.0.write().or_poisoned();
         *writable = parts
     }
     /// Set the status of the returned Response.
     pub fn set_status(&self, status: StatusCode) {
-        let mut writeable = self.0.write();
+        let mut writeable = self.0.write().or_poisoned();
         let res_parts = &mut *writeable;
         res_parts.status = Some(status);
     }
     /// Insert a header, overwriting any previous value with the same key.
     pub fn insert_header(&self, key: HeaderName, value: HeaderValue) {
-        let mut writeable = self.0.write();
+        let mut writeable = self.0.write().or_poisoned();
         let res_parts = &mut *writeable;
         res_parts.headers.insert(key, value);
     }
     /// Append a header, leaving any header with the same key intact.
     pub fn append_header(&self, key: HeaderName, value: HeaderValue) {
-        let mut writeable = self.0.write();
+        let mut writeable = self.0.write().or_poisoned();
         let res_parts = &mut *writeable;
         res_parts.headers.append(key, value);
     }
@@ -166,7 +175,7 @@ impl ExtendResponse for AxumResponse {
     }
 
     fn extend_response(&mut self, res_options: &Self::ResponseOptions) {
-        let mut res_options = res_options.0.write();
+        let mut res_options = res_options.0.write().or_poisoned();
         if let Some(status) = res_options.status {
             *self.0.status_mut() = status;
         }
@@ -370,8 +379,6 @@ async fn handle_server_fns_inner(
     additional_context: impl Fn() + 'static + Clone + Send,
     req: Request<Body>,
 ) -> impl IntoResponse {
-    use server_fn::middleware::Service;
-
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let (req, parts) = generate_request_and_parts(req);
@@ -383,10 +390,10 @@ async fn handle_server_fns_inner(
         owner
             .with(|| {
                 ScopedFuture::new(async move {
-                    additional_context();
                     provide_context(parts);
                     let res_options = ResponseOptions::default();
                     provide_context(res_options.clone());
+                    additional_context();
 
                     // store Accepts and Referer in case we need them for redirect (below)
                     let accepts_html = req
@@ -487,7 +494,7 @@ pub type PinnedHtmlStream =
     tracing::instrument(level = "trace", fields(error), skip_all)
 )]
 pub fn render_app_to_stream<IV>(
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     Request<Body>,
 ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>
@@ -511,7 +518,7 @@ where
 )]
 pub fn render_route<S, IV>(
     paths: Vec<AxumRouteListing>,
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     State<S>,
     Request<Body>,
@@ -576,7 +583,7 @@ where
     tracing::instrument(level = "trace", fields(error), skip_all)
 )]
 pub fn render_app_to_stream_in_order<IV>(
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     Request<Body>,
 ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>
@@ -592,7 +599,7 @@ where
 /// Returns an Axum [Handler](axum::handler::Handler) that listens for a `GET` request and tries
 /// to route it using [leptos_router], serving an HTML stream of your application.
 ///
-/// This version allows us to pass Axum State/Extension/Extractor or other infro from Axum or network
+/// This version allows us to pass Axum State/Extension/Extractor or other info from Axum or network
 /// layers above Leptos itself. To use it, you'll need to write your own handler function that provides
 /// the data to leptos in a closure. An example is below
 /// ```
@@ -629,13 +636,14 @@ where
     tracing::instrument(level = "trace", fields(error), skip_all)
 )]
 pub fn render_app_to_stream_with_context<IV>(
-    additional_context: impl Fn() + 'static + Clone + Send,
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    additional_context: impl Fn() + 'static + Clone + Send + Sync,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     Request<Body>,
 ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>
        + Clone
        + Send
+       + Sync
        + 'static
 where
     IV: IntoView + 'static,
@@ -658,8 +666,8 @@ where
 )]
 pub fn render_route_with_context<S, IV>(
     paths: Vec<AxumRouteListing>,
-    additional_context: impl Fn() + 'static + Clone + Send,
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    additional_context: impl Fn() + 'static + Clone + Send + Sync,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     State<S>,
     Request<Body>,
@@ -760,25 +768,32 @@ where
     tracing::instrument(level = "trace", fields(error), skip_all)
 )]
 pub fn render_app_to_stream_with_context_and_replace_blocks<IV>(
-    additional_context: impl Fn() + 'static + Clone + Send,
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    additional_context: impl Fn() + 'static + Clone + Send + Sync,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
     replace_blocks: bool,
 ) -> impl Fn(
     Request<Body>,
 ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>
        + Clone
        + Send
+       + Sync
        + 'static
 where
     IV: IntoView + 'static,
 {
     _ = replace_blocks; // TODO
-    handle_response(additional_context, app_fn, |app, chunks| {
+    handle_response(additional_context, app_fn, |app, chunks, supports_ooo| {
         Box::pin(async move {
-            let app = if cfg!(feature = "dont-use-islands-router") {
-                app.to_html_stream_out_of_order_branching()
-            } else {
+            let app = if cfg!(feature = "islands-router") {
+                if supports_ooo {
+                    app.to_html_stream_out_of_order_branching()
+                } else {
+                    app.to_html_stream_in_order_branching()
+                }
+            } else if supports_ooo {
                 app.to_html_stream_out_of_order()
+            } else {
+                app.to_html_stream_in_order()
             };
             Box::pin(app.chain(chunks())) as PinnedStream<String>
         })
@@ -790,7 +805,7 @@ where
 /// This stream will pause at each `<Suspense/>` node and wait for it to resolve before
 /// sending down its HTML. The app will become interactive once it has fully loaded.
 ///
-/// This version allows us to pass Axum State/Extension/Extractor or other infro from Axum or network
+/// This version allows us to pass Axum State/Extension/Extractor or other info from Axum or network
 /// layers above Leptos itself. To use it, you'll need to write your own handler function that provides
 /// the data to leptos in a closure. An example is below
 /// ```
@@ -827,8 +842,8 @@ where
     tracing::instrument(level = "trace", fields(error), skip_all)
 )]
 pub fn render_app_to_stream_in_order_with_context<IV>(
-    additional_context: impl Fn() + 'static + Clone + Send,
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    additional_context: impl Fn() + 'static + Clone + Send + Sync,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     Request<Body>,
 ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>
@@ -838,8 +853,8 @@ pub fn render_app_to_stream_in_order_with_context<IV>(
 where
     IV: IntoView + 'static,
 {
-    handle_response(additional_context, app_fn, |app, chunks| {
-        let app = if cfg!(feature = "dont-use-islands-router") {
+    handle_response(additional_context, app_fn, |app, chunks, _supports_ooo| {
+        let app = if cfg!(feature = "islands-router") {
             app.to_html_stream_in_order_branching()
         } else {
             app.to_html_stream_in_order()
@@ -851,13 +866,18 @@ where
 }
 
 fn handle_response<IV>(
-    additional_context: impl Fn() + 'static + Clone + Send,
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    additional_context: impl Fn() + 'static + Clone + Send + Sync,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
     stream_builder: fn(
         IV,
         BoxedFnOnce<PinnedStream<String>>,
+        bool,
     ) -> PinnedFuture<PinnedStream<String>>,
-) -> impl Fn(Request<Body>) -> PinnedFuture<Response<Body>> + Clone + Send + 'static
+) -> impl Fn(Request<Body>) -> PinnedFuture<Response<Body>>
+       + Clone
+       + Send
+       + Sync
+       + 'static
 where
     IV: IntoView + 'static,
 {
@@ -868,19 +888,24 @@ where
     }
 }
 
-fn handle_response_inner<IV>(
+/// Can be used in conjunction with a custom [file_and_error_handler_with_context] to process an Axum [Request](axum::extract::Request) into an Axum [Response](axum::response::Response)
+pub fn handle_response_inner<IV>(
     additional_context: impl Fn() + 'static + Clone + Send,
     app_fn: impl FnOnce() -> IV + Send + 'static,
     req: Request<Body>,
     stream_builder: fn(
         IV,
         BoxedFnOnce<PinnedStream<String>>,
+        bool,
     ) -> PinnedFuture<PinnedStream<String>>,
 ) -> PinnedFuture<Response<Body>>
 where
     IV: IntoView + 'static,
 {
     Box::pin(async move {
+        let is_island_router_navigation = cfg!(feature = "islands-router")
+            && req.headers().get("Islands-Router").is_some();
+
         let add_context = additional_context.clone();
         let res_options = ResponseOptions::default();
         let (meta_context, meta_output) = ServerMetaContext::new();
@@ -902,6 +927,10 @@ where
                     res_options.clone(),
                 );
                 add_context();
+
+                if is_island_router_navigation {
+                    provide_context(IslandsRouterNavigation);
+                }
             }
         };
 
@@ -911,6 +940,7 @@ where
             additional_context,
             res_options,
             stream_builder,
+            !is_island_router_navigation,
         )
         .await;
 
@@ -985,7 +1015,7 @@ fn provide_contexts(
     tracing::instrument(level = "trace", fields(error), skip_all)
 )]
 pub fn render_app_async<IV>(
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     Request<Body>,
 ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>
@@ -1002,7 +1032,7 @@ where
 /// to route it using [leptos_router], asynchronously rendering an HTML page after all
 /// `async` resources have loaded.
 ///
-/// This version allows us to pass Axum State/Extension/Extractor or other infro from Axum or network
+/// This version allows us to pass Axum State/Extension/Extractor or other info from Axum or network
 /// layers above Leptos itself. To use it, you'll need to write your own handler function that provides
 /// the data to leptos in a closure. An example is below
 /// ```
@@ -1039,8 +1069,8 @@ where
     tracing::instrument(level = "trace", fields(error), skip_all)
 )]
 pub fn render_app_async_stream_with_context<IV>(
-    additional_context: impl Fn() + 'static + Clone + Send,
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    additional_context: impl Fn() + 'static + Clone + Send + Sync,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     Request<Body>,
 ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>
@@ -1050,9 +1080,9 @@ pub fn render_app_async_stream_with_context<IV>(
 where
     IV: IntoView + 'static,
 {
-    handle_response(additional_context, app_fn, |app, chunks| {
+    handle_response(additional_context, app_fn, |app, chunks, _supports_ooo| {
         Box::pin(async move {
-            let app = if cfg!(feature = "dont-use-islands-router") {
+            let app = if cfg!(feature = "islands-router") {
                 app.to_html_stream_in_order_branching()
             } else {
                 app.to_html_stream_in_order()
@@ -1069,7 +1099,7 @@ where
 /// to route it using [leptos_router], asynchronously rendering an HTML page after all
 /// `async` resources have loaded.
 ///
-/// This version allows us to pass Axum State/Extension/Extractor or other infro from Axum or network
+/// This version allows us to pass Axum State/Extension/Extractor or other info from Axum or network
 /// layers above Leptos itself. To use it, you'll need to write your own handler function that provides
 /// the data to leptos in a closure. An example is below
 /// ```
@@ -1106,8 +1136,8 @@ where
     tracing::instrument(level = "trace", fields(error), skip_all)
 )]
 pub fn render_app_async_with_context<IV>(
-    additional_context: impl Fn() + 'static + Clone + Send,
-    app_fn: impl Fn() -> IV + Clone + Send + 'static,
+    additional_context: impl Fn() + 'static + Clone + Send + Sync,
+    app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
 ) -> impl Fn(
     Request<Body>,
 ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>
@@ -1123,12 +1153,13 @@ where
 fn async_stream_builder<IV>(
     app: IV,
     chunks: BoxedFnOnce<PinnedStream<String>>,
+    _supports_ooo: bool,
 ) -> PinnedFuture<PinnedStream<String>>
 where
     IV: IntoView + 'static,
 {
     Box::pin(async move {
-        let app = if cfg!(feature = "dont-use-islands-router") {
+        let app = if cfg!(feature = "islands-router") {
             app.to_html_stream_in_order_branching()
         } else {
             app.to_html_stream_in_order()
@@ -1155,7 +1186,7 @@ where
     generate_route_list_with_exclusions_and_ssg(app_fn, None).0
 }
 
-/// Generates a list of all routes defined in Leptos's Router in your app. We can then use t.clone()his to automatically
+/// Generates a list of all routes defined in Leptos's Router in your app. We can then use this to automatically
 /// create routes in Axum's Router without having to use wildcard matching or fallbacks. Takes in your root app Element
 /// as an argument so it can walk you app tree. This version is tailored to generate Axum compatible paths.
 #[cfg_attr(
@@ -1365,6 +1396,10 @@ where
 /// Allows generating any prerendered routes.
 #[allow(clippy::type_complexity)]
 pub struct StaticRouteGenerator(
+    // this is here to keep the root owner alive for the duration
+    // of the route generation, so that base context provided continues
+    // to exist until it is dropped
+    #[allow(dead_code)] Owner,
     Box<dyn FnOnce(&LeptosOptions) -> PinnedFuture<()> + Send>,
 );
 
@@ -1401,6 +1436,7 @@ impl StaticRouteGenerator {
             app_fn.clone(),
             additional_context,
             async_stream_builder,
+            false,
         );
 
         let sc = owner.shared_context().unwrap();
@@ -1431,14 +1467,16 @@ impl StaticRouteGenerator {
     {
         #[cfg(feature = "default")]
         {
-            Self({
+            let owner = Owner::new();
+            Self(owner.clone(), {
                 let routes = routes.clone();
                 Box::new(move |options| {
                     let options = options.clone();
                     let app_fn = app_fn.clone();
                     let additional_context = additional_context.clone();
-
-                    Box::pin(routes.generate_static_files(
+                    owner.with(|| {
+                        additional_context();
+                        Box::pin(ScopedFuture::new(routes.generate_static_files(
                         move |path: &ResolvedStaticPath| {
                             Self::render_route(
                                 path.to_string(),
@@ -1463,7 +1501,8 @@ impl StaticRouteGenerator {
                             }
                         },
                         was_404,
-                    ))
+                    )))
+                    })
                 })
             })
         }
@@ -1473,29 +1512,33 @@ impl StaticRouteGenerator {
             _ = routes;
             _ = app_fn;
             _ = additional_context;
-            Self(Box::new(|_| {
-                panic!(
-                    "Static routes are not currently supported on WASM32 \
-                     server targets."
-                );
-            }))
+            Self(
+                Owner::new(),
+                Box::new(|_| {
+                    panic!(
+                        "Static routes are not currently supported on WASM32 \
+                         server targets."
+                    );
+                }),
+            )
         }
     }
 
     /// Generates the routes.
     pub async fn generate(self, options: &LeptosOptions) {
-        (self.0)(options).await
+        (self.1)(options).await
     }
 }
 
 #[cfg(feature = "default")]
-static STATIC_HEADERS: Lazy<DashMap<String, ResponseOptions>> =
-    Lazy::new(DashMap::new);
+static STATIC_HEADERS: LazyLock<
+    std::sync::RwLock<HashMap<String, ResponseOptions>>,
+> = LazyLock::new(Default::default);
 
 #[cfg(feature = "default")]
 fn was_404(owner: &Owner) -> bool {
     let resp = owner.with(|| expect_context::<ResponseOptions>());
-    let status = resp.0.read().status;
+    let status = resp.0.read().or_poisoned().status;
 
     if let Some(status) = status {
         return status == StatusCode::NOT_FOUND;
@@ -1511,7 +1554,7 @@ fn static_path(options: &LeptosOptions, path: &str) -> String {
     // If the path ends with a trailing slash, we generate the path
     // as a directory with a index.html file inside.
     if path != "/" && path.ends_with("/") {
-        static_file_path(options, &format!("{}index", path))
+        static_file_path(options, &format!("{path}index"))
     } else {
         static_file_path(options, path)
     }
@@ -1525,7 +1568,10 @@ async fn write_static_route(
     html: &str,
 ) -> Result<(), std::io::Error> {
     if let Some(options) = response_options {
-        STATIC_HEADERS.insert(path.to_string(), options);
+        STATIC_HEADERS
+            .write()
+            .or_poisoned()
+            .insert(path.to_string(), options);
     }
 
     let path = static_path(options, path);
@@ -1602,7 +1648,8 @@ where
                     .await;
                 (owner.with(use_context::<ResponseOptions>), html)
             } else {
-                let headers = STATIC_HEADERS.get(orig_path).map(|v| v.clone());
+                let headers =
+                    STATIC_HEADERS.read().or_poisoned().get(orig_path).cloned();
                 (headers, None)
             };
 
@@ -1646,7 +1693,7 @@ where
         self,
         options: &S,
         paths: Vec<AxumRouteListing>,
-        app_fn: impl Fn() -> IV + Clone + Send + 'static,
+        app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
     ) -> Self
     where
         IV: IntoView + 'static;
@@ -1661,8 +1708,8 @@ where
         self,
         options: &S,
         paths: Vec<AxumRouteListing>,
-        additional_context: impl Fn() + 'static + Clone + Send,
-        app_fn: impl Fn() -> IV + Clone + Send + 'static,
+        additional_context: impl Fn() + 'static + Clone + Send + Sync,
+        app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
     ) -> Self
     where
         IV: IntoView + 'static;
@@ -1695,12 +1742,15 @@ impl AxumPath for Vec<PathSegment> {
             match segment {
                 PathSegment::Static(s) => path.push_str(s),
                 PathSegment::Param(s) => {
-                    path.push(':');
+                    path.push('{');
                     path.push_str(s);
+                    path.push('}');
                 }
                 PathSegment::Splat(s) => {
+                    path.push('{');
                     path.push('*');
                     path.push_str(s);
+                    path.push('}');
                 }
                 PathSegment::Unit => {}
                 PathSegment::OptionalParam(_) => {
@@ -1732,7 +1782,7 @@ where
         self,
         state: &S,
         paths: Vec<AxumRouteListing>,
-        app_fn: impl Fn() -> IV + Clone + Send + 'static,
+        app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
     ) -> Self
     where
         IV: IntoView + 'static,
@@ -1748,8 +1798,8 @@ where
         self,
         state: &S,
         paths: Vec<AxumRouteListing>,
-        additional_context: impl Fn() + 'static + Clone + Send,
-        app_fn: impl Fn() -> IV + Clone + Send + 'static,
+        additional_context: impl Fn() + 'static + Clone + Send + Sync,
+        app_fn: impl Fn() -> IV + Clone + Send + Sync + 'static,
     ) -> Self
     where
         IV: IntoView + 'static,
@@ -1830,64 +1880,64 @@ where
                     }
                 } else {
                     router.route(
-                    path,
-                    match listing.mode() {
-                        SsrMode::OutOfOrder => {
-                            let s = render_app_to_stream_with_context(
-                                cx_with_state_and_method.clone(),
-                                app_fn.clone(),
-                            );
-                            match method {
-                                leptos_router::Method::Get => get(s),
-                                leptos_router::Method::Post => post(s),
-                                leptos_router::Method::Put => put(s),
-                                leptos_router::Method::Delete => delete(s),
-                                leptos_router::Method::Patch => patch(s),
+                        path,
+                        match listing.mode() {
+                            SsrMode::OutOfOrder => {
+                                let s = render_app_to_stream_with_context(
+                                    cx_with_state_and_method.clone(),
+                                    app_fn.clone(),
+                                );
+                                match method {
+                                    leptos_router::Method::Get => get(s),
+                                    leptos_router::Method::Post => post(s),
+                                    leptos_router::Method::Put => put(s),
+                                    leptos_router::Method::Delete => delete(s),
+                                    leptos_router::Method::Patch => patch(s),
+                                }
                             }
-                        }
-                        SsrMode::PartiallyBlocked => {
-                            let s = render_app_to_stream_with_context_and_replace_blocks(
-                                cx_with_state_and_method.clone(),
-                                app_fn.clone(),
-                                true
-                            );
-                            match method {
-                                leptos_router::Method::Get => get(s),
-                                leptos_router::Method::Post => post(s),
-                                leptos_router::Method::Put => put(s),
-                                leptos_router::Method::Delete => delete(s),
-                                leptos_router::Method::Patch => patch(s),
+                            SsrMode::PartiallyBlocked => {
+                                let s = render_app_to_stream_with_context_and_replace_blocks(
+                                    cx_with_state_and_method.clone(),
+                                    app_fn.clone(),
+                                    true
+                                );
+                                match method {
+                                    leptos_router::Method::Get => get(s),
+                                    leptos_router::Method::Post => post(s),
+                                    leptos_router::Method::Put => put(s),
+                                    leptos_router::Method::Delete => delete(s),
+                                    leptos_router::Method::Patch => patch(s),
+                                }
                             }
-                        }
-                        SsrMode::InOrder => {
-                            let s = render_app_to_stream_in_order_with_context(
-                                cx_with_state_and_method.clone(),
-                                app_fn.clone(),
-                            );
-                            match method {
-                                leptos_router::Method::Get => get(s),
-                                leptos_router::Method::Post => post(s),
-                                leptos_router::Method::Put => put(s),
-                                leptos_router::Method::Delete => delete(s),
-                                leptos_router::Method::Patch => patch(s),
+                            SsrMode::InOrder => {
+                                let s = render_app_to_stream_in_order_with_context(
+                                    cx_with_state_and_method.clone(),
+                                    app_fn.clone(),
+                                );
+                                match method {
+                                    leptos_router::Method::Get => get(s),
+                                    leptos_router::Method::Post => post(s),
+                                    leptos_router::Method::Put => put(s),
+                                    leptos_router::Method::Delete => delete(s),
+                                    leptos_router::Method::Patch => patch(s),
+                                }
                             }
-                        }
-                        SsrMode::Async => {
-                            let s = render_app_async_with_context(
-                                cx_with_state_and_method.clone(),
-                                app_fn.clone(),
-                            );
-                            match method {
-                                leptos_router::Method::Get => get(s),
-                                leptos_router::Method::Post => post(s),
-                                leptos_router::Method::Put => put(s),
-                                leptos_router::Method::Delete => delete(s),
-                                leptos_router::Method::Patch => patch(s),
+                            SsrMode::Async => {
+                                let s = render_app_async_with_context(
+                                    cx_with_state_and_method.clone(),
+                                    app_fn.clone(),
+                                );
+                                match method {
+                                    leptos_router::Method::Get => get(s),
+                                    leptos_router::Method::Post => post(s),
+                                    leptos_router::Method::Put => put(s),
+                                    leptos_router::Method::Delete => delete(s),
+                                    leptos_router::Method::Patch => patch(s),
+                                }
                             }
-                        }
-                        _ => unreachable!()
-                    },
-                )
+                            _ => unreachable!()
+                        },
+                    )
                 };
             }
         }
@@ -1951,7 +2001,7 @@ where
 ///     Ok(format!("{method:?}"))
 /// }
 /// ```
-pub async fn extract<T>() -> Result<T, ServerFnError>
+pub async fn extract<T>() -> Result<T, ServerFnErrorErr>
 where
     T: Sized + FromRequestParts<()>,
     T::Rejection: Debug,
@@ -1966,29 +2016,34 @@ where
 /// therefore be used in an extractor. The compiler can often infer this type.
 ///
 /// Any error that occurs during extraction is converted to a [`ServerFnError`].
-pub async fn extract_with_state<T, S>(state: &S) -> Result<T, ServerFnError>
+pub async fn extract_with_state<T, S>(state: &S) -> Result<T, ServerFnErrorErr>
 where
     T: Sized + FromRequestParts<S>,
     T::Rejection: Debug,
 {
     let mut parts = use_context::<Parts>().ok_or_else(|| {
-        ServerFnError::new(
-            "should have had Parts provided by the leptos_axum integration",
+        ServerFnErrorErr::ServerError(
+            "should have had Parts provided by the leptos_axum integration"
+                .to_string(),
         )
     })?;
     T::from_request_parts(&mut parts, state)
         .await
-        .map_err(|e| ServerFnError::ServerError(format!("{e:?}")))
+        .map_err(|e| ServerFnErrorErr::ServerError(format!("{e:?}")))
 }
 
 /// A reasonable handler for serving static files (like JS/WASM/CSS) and 404 errors.
 ///
 /// This is provided as a convenience, but is a fairly simple function. If you need to adapt it,
-/// simply reuse the source code of this function in your own application.
+/// simply reuse the source code of this function in your own application.  A more compositional
+/// implementation is offered by [`ErrorHandler`] as it implements a tower [`Service`] which
+/// may be composed with other tower services.
+///
+/// [`Service`]: tower::Service
 #[cfg(feature = "default")]
 pub fn file_and_error_handler_with_context<S, IV>(
     additional_context: impl Fn() + 'static + Clone + Send,
-    shell: fn(LeptosOptions) -> IV,
+    shell: impl Fn(LeptosOptions) -> IV + 'static + Clone + Send,
 ) -> impl Fn(
     Uri,
     State<S>,
@@ -2005,6 +2060,7 @@ where
     move |uri: Uri, State(state): State<S>, req: Request<Body>| {
         Box::pin({
             let additional_context = additional_context.clone();
+            let shell = shell.clone();
             async move {
                 let options = LeptosOptions::from_ref(&state);
                 let res =
@@ -2012,21 +2068,36 @@ where
                 let res = res.await.unwrap();
 
                 if res.status() == StatusCode::OK {
-                    res.into_response()
+                    let owner = Owner::new();
+                    owner.with(|| {
+                        additional_context();
+                        let res = res.into_response();
+                        if let Some(response_options) =
+                            use_context::<ResponseOptions>()
+                        {
+                            let mut res = AxumResponse(res);
+                            res.extend_response(&response_options);
+                            res.0
+                        } else {
+                            res
+                        }
+                    })
                 } else {
                     let mut res = handle_response_inner(
                         move || {
-                            additional_context();
                             provide_context(state.clone());
+                            additional_context();
                         },
                         move || shell(options),
                         req,
-                        |app, chunks| {
+                        |app, chunks, _supports_ooo| {
                             Box::pin(async move {
-                                let app = app
-                                    .to_html_stream_in_order()
-                                    .collect::<String>()
-                                    .await;
+                                let app = if cfg!(feature = "islands-router") {
+                                    app.to_html_stream_in_order_branching()
+                                } else {
+                                    app.to_html_stream_in_order()
+                                };
+                                let app = app.collect::<String>().await;
                                 let chunks = chunks();
                                 Box::pin(once(async move { app }).chain(chunks))
                                     as PinnedStream<String>
@@ -2034,7 +2105,15 @@ where
                         },
                     )
                     .await;
-                    *res.status_mut() = StatusCode::NOT_FOUND;
+
+                    // set the status to 404
+                    // but if the status was already set (for example, to a 302 redirect) don't
+                    // overwrite it
+                    let status = res.status_mut();
+                    if *status == StatusCode::OK {
+                        *res.status_mut() = StatusCode::NOT_FOUND;
+                    }
+
                     res
                 }
             }
@@ -2045,10 +2124,14 @@ where
 /// A reasonable handler for serving static files (like JS/WASM/CSS) and 404 errors.
 ///
 /// This is provided as a convenience, but is a fairly simple function. If you need to adapt it,
-/// simply reuse the source code of this function in your own application.
+/// simply reuse the source code of this function in your own application.  A more compositional
+/// implementation is offered by [`ErrorHandler`] as it implements a tower [`Service`] which
+/// may be composed with other tower services.
+///
+/// [`Service`]: tower::Service
 #[cfg(feature = "default")]
 pub fn file_and_error_handler<S, IV>(
-    shell: fn(LeptosOptions) -> IV,
+    shell: impl Fn(LeptosOptions) -> IV + 'static + Clone + Send,
 ) -> impl Fn(
     Uri,
     State<S>,
@@ -2095,4 +2178,38 @@ async fn get_static_file(
             format!("Something went wrong: {err}"),
         )),
     }
+}
+
+/// A helper to create a [`ServeDir`] service for the static files under
+/// `LEPTOS_SITE_ROOT`.  This may be further configured before being assigned
+/// as the fallback service, or be attached as a service route on the router,
+/// typically with the path derived from [`site_pkg_dir_service_route_path`].
+///
+/// [`ServeDir`]: tower_http::services::ServeDir
+#[cfg(feature = "default")]
+pub fn site_pkg_dir_service(options: &LeptosOptions) -> ServeDir {
+    ServeDir::new(&*options.site_root)
+        .precompressed_gzip()
+        .precompressed_br()
+}
+
+/// A helper for constructing the axum route path from the `LeptosOptions`, can be used
+/// in conjunction with the [`ServeDir`] service produced by [`site_pkg_dir_service`]
+/// for setting up a routed site pkg service with [`Router::route_service`].
+///
+/// [`ServeDir`]: tower_http::services::ServeDir
+pub fn site_pkg_dir_service_route_path(options: &LeptosOptions) -> String {
+    // The path of the route being built will be constained to serve only the
+    // contents of `site_pkg_dir` to avoid conflicts with the root routes.
+    let mut path = String::new();
+    // While it shouldn't start with a '/', but check anyway.
+    if !options.site_pkg_dir.starts_with('/') {
+        path.push('/');
+    }
+    path.push_str(&options.site_pkg_dir);
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str("{*path}");
+    path
 }
